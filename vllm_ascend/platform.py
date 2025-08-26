@@ -135,6 +135,9 @@ class NPUPlatform(Platform):
             # assign lmhead tensor parallel size
             parallel_config.lmhead_tensor_parallel_size = (
                 ascend_config.lmhead_tensor_parallel_size)
+            # assign embedding tensor parallel size
+            parallel_config.embedding_tensor_parallel_size = (
+                ascend_config.embedding_tensor_parallel_size)
 
         if model_config is None:
             logger.warning("Model config is missing. This may indicate "
