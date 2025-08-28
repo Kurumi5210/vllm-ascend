@@ -152,16 +152,34 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
                                          params_dtype=params_dtype,
                                          weight_loader=self.weight_loader)
 
+    def _get_local_batch_slice(self, tensor: torch.Tensor, 
+                              batch_sizes: list, 
+                              local_batch_size: int, 
+                              rank: int) -> torch.Tensor:
+        """Extract local batch portion from gathered tensor.
+        
+        Args:
+            tensor: The gathered tensor to slice
+            batch_sizes: List of batch sizes for each rank
+            local_batch_size: Size of current rank's batch
+            rank: Current rank index
+            
+        Returns:
+            Sliced tensor containing only the local batch data
+        """
+        end_idx = batch_sizes[rank]
+        start_idx = end_idx - local_batch_size
+        return tensor[start_idx:end_idx]
     
     def forward(self, input_):
         if embedding_tp_enable():
+            logger.info(f"rank:{get_dp_group().rank_in_group}  embedding_tp_enable")
             return self._forward_embed_tp(input_)
         else:
             return self._forward_normal(input_)
         
     def _forward_embed_tp(self, input_):
         cu_tokens_across_dp_cpu = get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
-        
         global_dp_batch_size = torch.diff(cu_tokens_across_dp_cpu, prepend=cu_tokens_across_dp_cpu.new_zeros(1))
         logger.info(f"debug input_: {input_.shape} \n global_dp_batch_size: {global_dp_batch_size}\n ")
         lmhead_group_batch_size = [global_dp_batch_size[x] for x in get_lmhead_tp_group().ranks]
@@ -170,27 +188,26 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         torch.distributed.all_gather(
             gathered_input, input_, group=get_lmhead_tp_group().device_group)
         complete_input = torch.cat(gathered_input, dim=0)
+        masked_input, input_mask = get_masked_input_and_mask(
+            complete_input, self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index)
         logger.info(f"all_gather_down complete_input: {complete_input.shape}")
 
-        output = self.quant_method.embedding(self, complete_input.long())
-        input_splits = lmhead_group_batch_size
-        output_splits = [local_batch_size *
-                         self.num_embeddings_per_partition for _ in lmhead_group_batch_size]
-        all_to_all_result = torch.empty(
-            local_batch_size * (self.num_embeddings_per_partition * self.tp_size), #
-            dtype=output.dtype, device='npu')
-        logger.info(f"befor all_to_all_single output: {output.shape}")
-        dist.all_to_all_single(
-            all_to_all_result,
-            output,
-            output_splits,
-            input_splits,
-            group=get_lmhead_tp_group().device_group)
-        logger.info(f"after all_to_all_single all_to_all_result: {all_to_all_result.shape}")
-        reshaped = all_to_all_result.view(self.tp_size, local_batch_size, self.num_embeddings_per_partition)
-        logger.info(f"reshaped: {reshaped.shape}")
-        output = reshaped.permute(1, 0, 2).reshape(local_batch_size, -1)
-        logger.info(f"output: {output.shape}")
+        output = self.quant_method.embedding(self, masked_input.long())
+        output = tensor_model_parallel_all_reduce(output)
+        #         output = output[lmhead_group_batch_size[get_lmhead_tp_group().rank_in_group]-local_batch_size :lmhead_group_batch_size[get_lmhead_tp_group().rank_in_group]]
+        # Extract the local batch portion from the gathered output
+        lmhead_tp_group = get_lmhead_tp_group()
+        output = self._get_local_batch_slice(
+            output, 
+            lmhead_group_batch_size, 
+            local_batch_size, 
+            lmhead_tp_group.rank_in_group
+        )
+        logger.info(f"rank:{get_dp_group().rank_in_group}  output: {output.shape}")
         return output
 
     def _forward_normal(self, input_):
