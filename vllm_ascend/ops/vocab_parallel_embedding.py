@@ -154,7 +154,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
 
     
     def forward(self, input_):
-        if self.tp_size > 1 and embedding_tp_enable():
+        if embedding_tp_enable():
             return self._forward_embed_tp(input_)
         else:
             return self._forward_normal(input_)
@@ -163,7 +163,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         cu_tokens_across_dp_cpu = get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
         
         global_dp_batch_size = torch.diff(cu_tokens_across_dp_cpu, prepend=cu_tokens_across_dp_cpu.new_zeros(1))
-        logger.info(f"zzh-debug input_: {input_.shape} \n global_dp_batch_size: {global_dp_batch_size}\n ")
+        logger.info(f"debug input_: {input_.shape} \n global_dp_batch_size: {global_dp_batch_size}\n ")
         lmhead_group_batch_size = [global_dp_batch_size[x] for x in get_lmhead_tp_group().ranks]
         local_batch_size = input_.size(0)
         gathered_input = [torch.empty(batch_size, dtype=input_.dtype, device='npu') for batch_size in lmhead_group_batch_size]
@@ -213,8 +213,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
-        # logger output size
-        logger.info(f"rank:{get_dp_group().rank_in_group}  forward_normal output:{output.shape}, input:{input_.shape}")
+        logger.info(f"rank:{get_dp_group().rank_in_group}  forward_normal output:{output.shape}")
         return output
 
 
