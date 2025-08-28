@@ -154,7 +154,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
 
     
     def forward(self, input_):
-        if self.tp_size > 1:
+        if self.tp_size > 1 and embedding_tp_enable():
             return self._forward_embed_tp(input_)
         else:
             return self._forward_normal(input_)
@@ -177,7 +177,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         output_splits = [local_batch_size *
                          self.num_embeddings_per_partition for _ in lmhead_group_batch_size]
         all_to_all_result = torch.empty(
-            local_batch_size * (self.num_embeddings_per_partition * self.tp_size),
+            local_batch_size * (self.num_embeddings_per_partition * self.tp_size), #
             dtype=output.dtype, device='npu')
         logger.info(f"befor all_to_all_single output: {output.shape}")
         dist.all_to_all_single(
@@ -194,7 +194,6 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         return output
 
     def _forward_normal(self, input_):
-        
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -205,35 +204,17 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_end_index)
         else:
             masked_input = input_
+        logger.info(f"rank:{get_dp_group().rank_in_group}  masked_input:{masked_input.shape}")
         # Get the embeddings.
         output_parallel = self.quant_method.embedding(self, masked_input.long())
+        logger.info(f"rank:{get_dp_group().rank_in_group}  output_parallel:{output_parallel.shape}")
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
+        # logger output size
         logger.info(f"rank:{get_dp_group().rank_in_group}  forward_normal output:{output.shape}, input:{input_.shape}")
-        return output
-
-    def _forward_normal(self, input_):
-        if self.tp_size > 1:
-            # Build the mask.
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_, self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index)
-        else:
-            masked_input = input_
-        # Get the embeddings.
-        output_parallel = self.quant_method.embedding(self,
-                                                    masked_input.long())
-        # Mask the output embedding.
-        if self.tp_size > 1:
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
         return output
 
 
