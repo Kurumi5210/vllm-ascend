@@ -32,7 +32,8 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
 def enable_cp():
     prefill_config = get_current_vllm_config().parallel_config
     return prefill_config.prefill_context_parallel_size > 1 \
-                or prefill_config.decode_context_parallel_size > 1
+                or prefill_config.decode_context_parallel_size > 1 \
+                or prefill_config.dp_per_domain > 1 \
 
 
 @dataclass
@@ -149,6 +150,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # num_input_tokens refers to total number of tokens including
     # padding tokens. It is used to handle some padding operations.
     num_input_tokens: int = 0
+
+    num_dycp_reqs: int = 0
 
     prefill_context_parallel_metadata: Optional[
         AscendPrefillContextParallelMetadata] = None

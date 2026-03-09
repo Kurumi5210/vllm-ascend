@@ -15,7 +15,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
-
+from vllm.distributed import get_dycp_group
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -26,7 +26,9 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          maybe_save_kv_layer_to_connector,
                                          split_decodes_and_prefills,
                                          trans_rope_weight, transdata,
-                                         wait_for_kv_layer_from_connector)
+                                         wait_for_kv_layer_from_connector,
+                                         )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                get_mtp_graph_params,
                                                update_graph_params_workspaces)
@@ -164,6 +166,8 @@ class AscendMLAMetadata:
     decode: Optional[AscendMLADecodeMetadata] = None
     prefill: Optional[AscendMLAPrefillMetadata] = None
 
+    num_dycp_reqs: int = 0
+
     def __post_init__(self):
         pass
         # supported_head_sizes = AscendMLABackend.get_supported_head_sizes()
@@ -211,6 +215,12 @@ class AscendMLAMetadataBuilder:
             assert self.decode_threshold <= 16, f"decode_threshold exceeded \
                 npu_fused_infer_attention_score TND layout's limit of 16, \
                 got {self.decode_threshold}"
+        try:
+            self.dycp_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            self.dycp_size = 1
+            self.dycp_rank = 0
 
         self.reorder_batch_threshold = self.decode_threshold
         if self.chunked_prefill_enabled:
@@ -414,7 +424,17 @@ class AscendMLAMetadataBuilder:
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         self.query_lens = query_seq_lens_cpu[:num_reqs]
         self.seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
-
+        # logger.info(f"chenxiao--debug begin self.seq_lens:{self.seq_lens}")
+        if self.dycp_size > 1:
+            num_dycp_reqs = common_attn_metadata.num_dycp_reqs
+            dycp_local = get_dcp_local_seq_lens(
+                self.seq_lens[:num_dycp_reqs],
+                self.dycp_size,
+                self.dycp_rank,
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+            )
+            self.seq_lens[:num_dycp_reqs] = dycp_local
+        # logger.info(f"chenxiao--debug after self.seq_lens:{self.seq_lens}")
         self.set_prefill_block_table(common_attn_metadata)
 
         prefill_metadata = None
@@ -444,6 +464,7 @@ class AscendMLAMetadataBuilder:
             query_start_loc=query_start_loc,
             block_tables=self.block_table,
             seq_lens=self.seq_lens,
+            num_dycp_reqs=common_attn_metadata.num_dycp_reqs
         )
 
     def build_chunked_metadata(

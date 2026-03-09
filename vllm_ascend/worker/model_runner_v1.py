@@ -44,7 +44,7 @@ from vllm.distributed import (get_tensor_model_parallel_world_size,
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
-from vllm.distributed.parallel_state import (get_dcp_group, get_dp_group,
+from vllm.distributed.parallel_state import (get_dcp_group, get_dp_group, get_dycp_group,
                                              get_pcp_group, get_pp_group,
                                              get_tp_group,
                                              is_global_first_rank)
@@ -59,7 +59,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
-                                              CommonAttentionMetadata)
+                                              CommonAttentionMetadata,
+                                              get_dcp_local_seq_lens)
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         EncoderOnlyAttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
@@ -208,6 +209,8 @@ class NPUModelRunner(GPUModelRunner):
             self.pcp_rank = 0
         if self.pcp_size > 1:
             self.model_config.max_model_len += 2 * self.pcp_size * self.max_num_reqs
+        self.dycp_size = self.parallel_config.dp_per_domain
+        self.dycp_rank = 0 if self.dycp_size <= 1 else get_dycp_group().rank_in_group
         self.sampler = AscendSampler()
         self.attn_mask = None
         self.attn_state = None
@@ -576,9 +579,11 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.num_computed_tokens_cpu[req_indices],
             arange,
         )
-
-        self.input_batch.block_table.compute_slot_mapping(
-            req_indices, positions_np)
+        if self.dycp_size > 1:
+            self.input_batch.block_table.compute_domain_slot_mapping(req_indices, positions_np, scheduler_output.num_cp_request)
+        else:
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
 
@@ -759,8 +764,17 @@ class NPUModelRunner(GPUModelRunner):
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
-        self.seq_lens.copy_to_gpu()
+        # if self.dycp_size > 1:
+        #     num_dycp_reqs = scheduler_output.num_cp_request
+        #     dycp_local = get_dcp_local_seq_lens(
+        #         self.seq_lens.cpu[:num_dycp_reqs],
+        #         self.dycp_size,
+        #         self.dycp_rank,
+        #         self.parallel_config.cp_kv_cache_interleave_size,
+        #     )
+        #     self.seq_lens.np[:num_dycp_reqs] = dycp_local
 
+        self.seq_lens.copy_to_gpu()
         self.seq_lens.gpu[num_reqs:].fill_(0)
 
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
@@ -1066,7 +1080,8 @@ class NPUModelRunner(GPUModelRunner):
                 max_query_len=max_num_scheduled_tokens,
                 decode_token_per_req=self.decode_token_per_req,
                 prefill_context_parallel_metadata=long_seq_metadata,
-                max_seq_len=0)
+                max_seq_len=0,
+                num_dycp_reqs=scheduler_output.num_cp_request)
 
             if self.speculative_config and self.pcp_size * self.dcp_size > 1:
                 # For pcp + spec decode, we flatten block_table
@@ -1818,6 +1833,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: np.ndarray,
         aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
         force_attention: bool = False,
+        num_dycp_reqs: int = 0,
     ) -> Optional[dict[str, Any]]:
         attn_metadata: Optional[dict[str, Any]] = None
 
@@ -1856,9 +1872,14 @@ class NPUModelRunner(GPUModelRunner):
                 if long_seq_metadata is not None:
                     pcp_world_size = get_pcp_group().world_size
                     dcp_world_size = get_dcp_group().world_size
+                    dycp_world_size = get_dycp_group().world_size
                     num_computed_tokens_of_pcp_dcp = [[
                         [0] * dcp_world_size for _ in range(pcp_world_size)
                     ] for _ in range(num_tokens)]
+                    if dycp_world_size > 1:
+                        num_computed_tokens_of_pcp_dcp = [[
+                            [0] * dycp_world_size for _ in range(pcp_world_size)
+                        ] for _ in range(num_tokens)]
                     long_seq_metadata.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp
                 # QUESTION: Why do we separately set query_start_loc for spec in the first place?
                 # While in _prepare_inputs we don't?
@@ -1888,8 +1909,9 @@ class NPUModelRunner(GPUModelRunner):
                     max_query_len=max_query_len,
                     decode_token_per_req=self.decode_token_per_req,
                     prefill_context_parallel_metadata=long_seq_metadata,
-                    max_seq_len=0)
-                if self.pcp_size * self.dcp_size > 1:
+                    max_seq_len=0,
+                    num_dycp_reqs=scheduler_output.num_cp_request)
+                if self.pcp_size * self.dcp_size * self.dycp_size > 1:
                     common_attn_metadata.block_table_tensor = \
                         block_table_tensor[:num_reqs * self.decode_threshold]
                 attn_state = AscendAttentionState.DecodeOnly
@@ -1975,6 +1997,7 @@ class NPUModelRunner(GPUModelRunner):
         force_attention: bool = False,
         uniform_decode: bool = False,
         is_profile: bool = False,
+        num_dycp_reqs: int = 0,
     ) -> torch.Tensor:
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
@@ -2073,6 +2096,7 @@ class NPUModelRunner(GPUModelRunner):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             force_attention=force_attention,
             num_scheduled_tokens=num_scheduled_tokens,
+            num_dycp_reqs=num_dycp_reqs,
         )
 
         with self.maybe_dummy_run_with_lora(self.lora_config,
@@ -3171,6 +3195,19 @@ class NPUModelRunner(GPUModelRunner):
                 [
                     num_reqs * self.decode_threshold, self.pcp_size,
                     self.dcp_size
+                ],
+                dtype=torch.int32,
+            )
+        if self.dycp_size > 1:
+            decode_context_lens = self.input_batch.num_tokens[:num_decodes]
+            prefill_context_lens = self.input_batch.num_computed_tokens_cpu[
+                num_decodes:num_reqs]
+            context_lens = np.concatenate(
+                [decode_context_lens, prefill_context_lens])
+            num_computed_tokens_of_pcp_dcp = torch.zeros(
+                [
+                    num_reqs * self.decode_threshold, 1,
+                    self.dycp_size
                 ],
                 dtype=torch.int32,
             )

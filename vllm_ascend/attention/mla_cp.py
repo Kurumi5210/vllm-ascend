@@ -1,12 +1,12 @@
 from typing import ClassVar, Optional, Tuple, TypeVar
-
+from vllm.logger import logger
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch_npu
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.distributed import (get_dcp_group,
+from vllm.distributed import (get_dcp_group, get_dycp_group, 
                               get_decode_context_model_parallel_rank,
                               get_decode_context_model_parallel_world_size,
                               get_pcp_group)
@@ -65,6 +65,12 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank(
         ) if self.dcp_size > 1 else 0
+        try:
+            self.dycp_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            self.dycp_size = 1
+            self.dycp_rank = 0
         self.cp_local_block_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
         self.cp_virtual_block_size = self.cp_local_block_size * self.dcp_size * self.pcp_size
         scheduler_config = vllm_config.scheduler_config
@@ -134,7 +140,7 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         assert num_computed_tokens_of_pcp_dcp is not None
         local_context_lens_allranks = torch.tensor(
             num_computed_tokens_of_pcp_dcp[self.num_decodes_flatten:]).reshape(
-                -1, self.dcp_size * self.pcp_size)
+                -1, self.dcp_size * self.pcp_size * self.dycp_size)
         # Note(qcs): The max local context lengths
         # padded to `cp_local_block_size`.
         padded_local_context_lens_cpu = (cdiv(
@@ -281,6 +287,13 @@ class AscendMlaCPImpl(AscendMLAImpl):
         ) if self.dcp_size > 1 else 0
         self.dcp_group = get_dcp_group(
         ).device_group if self.dcp_size > 1 else None
+
+        try:
+            self.dycp_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            self.dycp_size = 1
+            self.dycp_rank = 0
 
     def _v_up_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -448,7 +461,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
 
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
-            if self.pcp_size * self.dcp_size > 1:
+            if self.pcp_size * self.dcp_size * self.dycp_size > 1:
                 output_decode = self._forward_decode_pcp_dcp(
                     decode_preprocess_res.ql_nope,
                     decode_preprocess_res.q_pe,
@@ -868,8 +881,14 @@ class AscendMlaCPImpl(AscendMLAImpl):
         q_nope = q_nope.view(num_tokens, num_heads, -1)
         q_pe = q_pe.view(num_tokens, num_heads, -1)
         # use pcp & dcp split computed token nums from scheduler to compute actual seq_len and seq_mask
-        seq_len = decode_meta.cp_seq_len
-
+        if self.dycp_size > 1:
+            seq_len = attn_metadata.seq_lens
+        else:
+            seq_len = decode_meta.cp_seq_len
+        # logger.info(f"chenxiao--debug seq_len:{seq_len}")
+        # logger.info(f"chenxiao--debug block table : {decode_meta.block_table.shape}")
+        # logger.info(f"chenxiao--debug decode_meta.block_table:{decode_meta.block_table}")
+        # logger.info(f"chenxiao--debug num block :{torch.count_nonzero(decode_meta.block_table[0]).item()}")
         common_kwargs = {
             "return_lse": True,
             "calc_type": "calc_type_ring",
@@ -941,7 +960,10 @@ class AscendMlaCPImpl(AscendMLAImpl):
 
         # Update out&lse
         attn_out_lse = self._process_attn_out_lse(attn_output, softmax_lse,
-                                                  decode_meta)
+                                                  decode_meta, attn_metadata.num_dycp_reqs)
+        if attn_metadata.num_dycp_reqs > 0:
+            # logger.info(f"chenxiao--debug attn_out_lse:{attn_out_lse.shape}")
+            return self._v_up_proj(attn_out_lse)
         attn_output = self._npu_attention_update(attn_out_lse)
         return self._v_up_proj(attn_output)
 
@@ -986,6 +1008,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         attn_output: torch.Tensor,
         softmax_lse: torch.Tensor,
         decode_meta: AscendMLADecodeMetadata,
+        num_dycp_reqs: int,
     ) -> torch.Tensor:
         out_mask = decode_meta.batch_seq_mask[:, None,
                                               None].expand_as(attn_output)
@@ -1006,13 +1029,21 @@ class AscendMlaCPImpl(AscendMLAImpl):
                                    attn_out_lse,
                                    group=self.dcp_group)
             attn_out_lse = attn_out_lse_all2all.permute([2, 0, 1])
-
+        from vllm.logger import logger
+        # logger.info(f"chenxiao--debug num_dycp_reqs:{num_dycp_reqs}")
+        if num_dycp_reqs > 0:
+            # logger.info(f"chenxiao--debug start process lse!!!!")
+            lse_exp = torch.exp(softmax_lse[:num_dycp_reqs])   # [bs, num_heads, 1]
+            weighted_output = attn_output[:num_dycp_reqs] * lse_exp  # [bs, num_heads, v_head_dim]
+            get_dycp_group().all_reduce(lse_exp)
+            get_dycp_group().all_reduce(weighted_output)
+            attn_output[:num_dycp_reqs] = weighted_output / lse_exp
+            return attn_output
         if self.pcp_size > 1:
             # AllGather out&lse within CP group
             attn_out_lse = get_pcp_group().all_gather(
                 attn_out_lse.contiguous(), dim=0)
-
-        return attn_out_lse
+        return attn_out_lse        
 
     def _reorg_kvcache(
         self,

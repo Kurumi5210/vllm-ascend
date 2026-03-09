@@ -821,7 +821,10 @@ def is_moe_model(vllm_config: VllmConfig):
         model_configs = vllm_config.model_config.hf_config.to_dict()
         _IS_MOE_MODEL = _is_contain_expert(model_configs)
     return _IS_MOE_MODEL
-
+def weak_ref_tensor_op(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.device.type == 'npu':
+        raise RuntimeError("Tensor must be on NPU device")
+    return tensor.as_strided(tensor.size(), tensor.stride(), tensor.storage_offset())
 
 def _is_contain_expert(config: Any):
     if isinstance(config, dict):
@@ -862,7 +865,7 @@ def weak_ref_tensor(tensor: Any) -> Any:
     but will not keep the original tensor alive.
     """
     if isinstance(tensor, torch.Tensor):
-        return torch.ops._C_ascend.weak_ref_tensor(tensor)
+        return weak_ref_tensor_op(tensor)
     else:
         return tensor
 
