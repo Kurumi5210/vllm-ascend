@@ -362,7 +362,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     cache_kv_c_k_pe, 0)
 
             if self.pcp_size > 1:
-                cache_kv_c_k_pe = get_pcp_group().all_gather(
+                cache_kv_c_k_pe = get_dycp_group().all_gather(
                     cache_kv_c_k_pe, 0)
 
             allgatered_kv_c_normed, allgatered_k_pe = cache_kv_c_k_pe.split(
@@ -482,16 +482,34 @@ class AscendMlaCPImpl(AscendMLAImpl):
             # FIX: aicore move should be also placed on the comm stream in dbo,
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
-            if self.pcp_size > 1:
-                output_prefill = self._forward_prefill_cp(
-                    prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
-                    prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
-                    prefill_preprocess_res.value, kv_cache, attn_metadata)
+            # if self.pcp_size > 1:
+            #     output_prefill = self._forward_prefill_cp(
+            #         prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
+            #         prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
+            #         prefill_preprocess_res.value, kv_cache, attn_metadata)
+            # else:
+            #     output_prefill = self._forward_prefill(
+            #         prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
+            #         prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
+            #         prefill_preprocess_res.value, kv_cache, attn_metadata)
+            num_dycp_reqs = attn_metadata.num_dycp_reqs
+            if num_dycp_reqs > 0:
+                dycp_attn_metadata, dp_attn_metadata = split_attn_metadata(attn_metadata, num_dycp_reqs)
+                output_prefill_cp = self._forward_prefill_cp(
+                    prefill_preprocess_res.q_nope[:num_dycp_reqs], prefill_preprocess_res.q_pe[:num_dycp_reqs],
+                    prefill_preprocess_res.k_nope[:num_dycp_reqs], prefill_preprocess_res.k_pe[:num_dycp_reqs],
+                    prefill_preprocess_res.value[:num_dycp_reqs], [kv_cache[0][:num_dycp_reqs], kv_cache[1][:num_dycp_reqs]], dycp_attn_metadata)
+                output_prefill_dp = self._forward_prefill(
+                    prefill_preprocess_res.q_nope[num_dycp_reqs:], prefill_preprocess_res.q_pe[num_dycp_reqs:],
+                    prefill_preprocess_res.k_nope[num_dycp_reqs:], prefill_preprocess_res.k_pe[num_dycp_reqs:],
+                    prefill_preprocess_res.value[num_dycp_reqs:], [kv_cache[0][num_dycp_reqs:], kv_cache[1][num_dycp_reqs:]], dp_attn_metadata)
+                output_prefill = torch.cat([output_prefill_cp, output_prefill_dp], dim=0)
             else:
                 output_prefill = self._forward_prefill(
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
                     prefill_preprocess_res.value, kv_cache, attn_metadata)
+
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         # O proj
@@ -622,7 +640,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 prefill_k_c_normed = kv_c_normed[:num_actual_tokens]
                 prefill_kv_c_k_pe = torch.cat(
                     [prefill_k_c_normed, prefill_k_pe], dim=-1)
-                prefill_kv_c_k_pe = get_pcp_group().all_gather(
+                prefill_kv_c_k_pe = get_dycp_group().all_gather(
                     prefill_kv_c_k_pe, 0)
                 prefill_kv_c_k_pe = torch.index_select(
                     prefill_kv_c_k_pe, 0, attn_metadata.prefill.pcp_metadata.
@@ -1029,7 +1047,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
                                    attn_out_lse,
                                    group=self.dcp_group)
             attn_out_lse = attn_out_lse_all2all.permute([2, 0, 1])
-        from vllm.logger import logger
         # logger.info(f"chenxiao--debug num_dycp_reqs:{num_dycp_reqs}")
         if num_dycp_reqs > 0:
             # logger.info(f"chenxiao--debug start process lse!!!!")
@@ -1041,7 +1058,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             return attn_output
         if self.pcp_size > 1:
             # AllGather out&lse within CP group
-            attn_out_lse = get_pcp_group().all_gather(
+            attn_out_lse = get_dycp_group().all_gather(
                 attn_out_lse.contiguous(), dim=0)
         return attn_out_lse        
 
@@ -1117,3 +1134,201 @@ class AscendMlaCPImpl(AscendMLAImpl):
         assert reorganized_k_pe.shape[0] == sum_seq_len
         assert max_seq_len_check == max_seq_len
         return reorganized_kv_c_normed, reorganized_k_pe
+# from dataclasses import replace
+
+def split_attn_metadata(
+    attn_metadata: AscendMLAMetadata,
+    num_dycp_reqs: int,
+) -> Tuple[AscendMLAMetadata, AscendMLAMetadata]:
+    """
+    将 AscendMLAMetadata 切分为 DYCP 和 DP 两部分。
+    
+    Args:
+        attn_metadata: 原始 metadata
+        num_dycp_reqs: DYCP 请求数量
+        
+    Returns:
+        (dycp_metadata, dp_metadata)
+    """
+    prefill_meta = attn_metadata.prefill
+    num_prefills = attn_metadata.num_prefills
+    
+    if num_dycp_reqs == 0:
+        return None, attn_metadata
+    if num_dycp_reqs >= num_prefills:
+        return attn_metadata, None
+    
+    # ========== 1. 计算 token 切分位置 ==========
+    if isinstance(prefill_meta.query_lens, torch.Tensor):
+        dycp_token_num = prefill_meta.query_lens[:num_dycp_reqs].sum().item()
+    else:
+        dycp_token_num = sum(prefill_meta.query_lens[:num_dycp_reqs])
+    
+    # ========== 2. 切分 prefill metadata ==========
+    dycp_prefill, dp_prefill = split_prefill_metadata(
+        prefill_meta, num_dycp_reqs, num_prefills, dycp_token_num
+    )
+    
+    # ========== 3. 切分顶层 metadata 的字段 ==========
+    
+    # slot_mapping (Tensor)
+    dycp_slot_mapping = attn_metadata.slot_mapping[:dycp_token_num]
+    dp_slot_mapping = attn_metadata.slot_mapping[dycp_token_num:]
+    
+    # query_start_loc (Tensor)
+    dycp_query_start_loc = attn_metadata.query_start_loc[:num_dycp_reqs + 1]
+    dp_query_start_loc = attn_metadata.query_start_loc[num_dycp_reqs:] - dycp_token_num
+    
+    # seq_lens (Tensor)
+    dycp_seq_lens = attn_metadata.seq_lens[:num_dycp_reqs]
+    dp_seq_lens = attn_metadata.seq_lens[num_dycp_reqs:]
+    
+    # block_tables (Tensor)
+    dycp_block_tables = attn_metadata.block_tables[:num_dycp_reqs]
+    dp_block_tables = attn_metadata.block_tables[num_dycp_reqs:]
+    
+    # query_lens (list)
+    dycp_query_lens = attn_metadata.query_lens[:num_dycp_reqs]
+    dp_query_lens = attn_metadata.query_lens[num_dycp_reqs:]
+    
+    # ========== 4. 构建新的 metadata ==========
+    dycp_metadata = AscendMLAMetadata(
+        num_actual_tokens_pcp_padded=attn_metadata.num_actual_tokens_pcp_padded,
+        num_actual_tokens=dycp_token_num,
+        slot_mapping=dycp_slot_mapping,
+        query_start_loc=dycp_query_start_loc,
+        seq_lens=dycp_seq_lens,
+        block_tables=dycp_block_tables,
+        num_decodes=0,  # prefill 场景
+        num_decode_tokens=0,
+        num_prefills=num_dycp_reqs,
+        num_input_tokens=dycp_token_num,
+        query_lens=dycp_query_lens,
+        head_dim=attn_metadata.head_dim,
+        attn_mask=prefill_meta.attn_mask[:dycp_token_num],
+        attn_state=attn_metadata.attn_state,
+        decode=None,
+        prefill=dycp_prefill,
+        num_dycp_reqs=num_dycp_reqs,
+    )
+    
+    dp_token_num = attn_metadata.num_actual_tokens - dycp_token_num
+    dp_metadata = AscendMLAMetadata(
+        num_actual_tokens_pcp_padded=attn_metadata.num_actual_tokens_pcp_padded,
+        num_actual_tokens=dp_token_num,
+        slot_mapping=dp_slot_mapping,
+        query_start_loc=dp_query_start_loc,
+        seq_lens=dp_seq_lens,
+        block_tables=dp_block_tables,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=num_prefills - num_dycp_reqs,
+        num_input_tokens=dp_token_num,
+        query_lens=dp_query_lens,
+        head_dim=attn_metadata.head_dim,
+        attn_mask=prefill_meta.attn_mask[dycp_token_num:],
+        attn_state=attn_metadata.attn_state,
+        decode=None,
+        prefill=dp_prefill,
+        num_dycp_reqs=0,
+    )
+    
+    return dycp_metadata, dp_metadata
+
+
+def split_prefill_metadata(
+    prefill_meta: AscendMLAPrefillMetadata,
+    num_dycp_reqs: int,
+    dycp_token_num: int,
+) -> Tuple[AscendMLAPrefillMetadata, AscendMLAPrefillMetadata]:
+    """切分 AscendMLAPrefillMetadata"""
+    
+    # ========== 处理 query_lens ==========
+    if isinstance(prefill_meta.query_lens, torch.Tensor):
+        dycp_query_lens = prefill_meta.query_lens[:num_dycp_reqs]
+        dp_query_lens = prefill_meta.query_lens[num_dycp_reqs:]
+    else:
+        dycp_query_lens = prefill_meta.query_lens[:num_dycp_reqs]
+        dp_query_lens = prefill_meta.query_lens[num_dycp_reqs:]
+    
+    # ========== 处理 seq_lens (list) ==========
+    dycp_seq_lens = prefill_meta.seq_lens[:num_dycp_reqs]
+    dp_seq_lens = prefill_meta.seq_lens[num_dycp_reqs:]
+    
+    # ========== 处理 context_lens (Tensor) ==========
+    dycp_context_lens = prefill_meta.context_lens[:num_dycp_reqs]
+    dp_context_lens = prefill_meta.context_lens[num_dycp_reqs:]
+    
+    # ========== 处理 input_positions (Tensor) ==========
+    dycp_input_positions = prefill_meta.input_positions[:dycp_token_num]
+    dp_input_positions = prefill_meta.input_positions[dycp_token_num:]
+    
+    # ========== 处理 query_start_loc (Tensor) ==========
+    dycp_query_start_loc = prefill_meta.query_start_loc[:num_dycp_reqs + 1]
+    dp_query_start_loc = prefill_meta.query_start_loc[num_dycp_reqs:] - dycp_token_num
+    
+    # ========== 处理 block_table (Tensor) ==========
+    dycp_block_table = prefill_meta.block_table[:num_dycp_reqs]
+    dp_block_table = prefill_meta.block_table[num_dycp_reqs:]
+    
+    # ========== 处理 attn_mask (Tensor) ==========
+    dycp_attn_mask = prefill_meta.attn_mask[:dycp_token_num]
+    dp_attn_mask = prefill_meta.attn_mask[dycp_token_num:]
+    
+    # ========== 处理 sin/cos (Tensor) ==========
+    dycp_sin = prefill_meta.sin[:dycp_token_num] if prefill_meta.sin is not None else None
+    dp_sin = prefill_meta.sin[dycp_token_num:] if prefill_meta.sin is not None else None
+    dycp_cos = prefill_meta.cos[:dycp_token_num] if prefill_meta.cos is not None else None
+    dp_cos = prefill_meta.cos[dycp_token_num:] if prefill_meta.cos is not None else None
+    
+    # ========== 处理 max_query_len / max_seq_lens ==========
+    if isinstance(dycp_query_lens, torch.Tensor):
+        dycp_max_query_len = dycp_query_lens.max().item() if dycp_query_lens.numel() > 0 else 0
+        dp_max_query_len = dp_query_lens.max().item() if dp_query_lens.numel() > 0 else 0
+    else:
+        dycp_max_query_len = max(dycp_query_lens) if dycp_query_lens else 0
+        dp_max_query_len = max(dp_query_lens) if dp_query_lens else 0
+    
+    dycp_max_seq_lens = max(dycp_seq_lens) if dycp_seq_lens else 0
+    dp_max_seq_lens = max(dp_seq_lens) if dp_seq_lens else 0
+    
+    # ========== 处理 pcp_metadata / chunked_context ==========
+    # DYCP 需要，DP 不需要
+    dycp_pcp_metadata = prefill_meta.pcp_metadata
+    dycp_chunked_context = prefill_meta.chunked_context
+    
+    # ========== 构建 DYCP Prefill Metadata ==========
+    dycp_prefill = AscendMLAPrefillMetadata(
+        attn_mask=dycp_attn_mask,
+        query_lens=dycp_query_lens,
+        seq_lens=dycp_seq_lens,
+        context_lens=dycp_context_lens,
+        input_positions=dycp_input_positions,
+        query_start_loc=dycp_query_start_loc,
+        block_table=dycp_block_table,
+        max_query_len=dycp_max_query_len,
+        max_seq_lens=dycp_max_seq_lens,
+        chunked_context=dycp_chunked_context,
+        sin=dycp_sin,
+        cos=dycp_cos,
+        pcp_metadata=dycp_pcp_metadata,
+    )
+    
+    # ========== 构建 DP Prefill Metadata ==========
+    dp_prefill = AscendMLAPrefillMetadata(
+        attn_mask=dp_attn_mask,
+        query_lens=dp_query_lens,
+        seq_lens=dp_seq_lens,
+        context_lens=dp_context_lens,
+        input_positions=dp_input_positions,
+        query_start_loc=dp_query_start_loc,
+        block_table=dp_block_table,
+        max_query_len=dp_max_query_len,
+        max_seq_lens=dp_max_seq_lens,
+        chunked_context=None,  # DP 不需要
+        sin=dp_sin,
+        cos=dp_cos,
+        pcp_metadata=None,  # DP 不需要
+    )
+    
+    return dycp_prefill, dp_prefill
