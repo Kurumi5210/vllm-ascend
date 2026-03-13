@@ -390,6 +390,12 @@ class AscendMLAMetadataBuilder:
     ):
         self.num_actual_tokens = common_attn_metadata.num_actual_tokens
 
+    def get_num_actual_tokens_pcp_padded(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ):
+        return common_attn_metadata.num_actual_tokens
+
     def build(
         self,
         common_prefix_len: int,
@@ -448,7 +454,7 @@ class AscendMLAMetadataBuilder:
                 common_prefix_len, common_attn_metadata, model)
 
         return self.metadata_cls(  # type: ignore
-            num_actual_tokens_pcp_padded=self.num_actual_tokens,
+            num_actual_tokens_pcp_padded=self.get_num_actual_tokens_pcp_padded(common_attn_metadata),
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=self.num_actual_tokens,
             query_lens=self.query_lens.tolist(),
@@ -1158,6 +1164,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         B, N, D = x.shape
         S = 1
         x = x.view(B, N, S, D)
+        logger.info(f"======= rope single, x: {x.shape}, cos: {cos.shape}, sin: {sin.shape}")
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 

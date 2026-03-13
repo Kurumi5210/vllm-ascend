@@ -449,45 +449,8 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
 
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
-            dycp_metadata, dp_metadata = split_attn_metadata(attn_metadata, attn_metadata.num_dycp_reqs, self.dycp_size)
-            
-            if dycp_metadata:
-                logger.info(f"====== dycp_metadata.num_actual_tokens: {dycp_metadata.num_actual_tokens}")
-                # dycp_output = torch.empty(
-                #     attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size,
-                #     output.shape[1],
-                #     dtype=hidden_states.dtype,
-                #     device=hidden_states.device,
-                # )
-                cp_hidden_states = hidden_states[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size]
-                co_out = self._forward_common(layer_name, cp_hidden_states, kv_cache, dycp_metadata, need_gather_q_kv, output[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size])
-            if dp_metadata:
-                # dp_output = torch.empty(
-                #     dp_metadata.num_actual_tokens,
-                #     output.shape[1],
-                #     dtype=hidden_states.dtype,
-                #     device=hidden_states.device,
-                # )
-                dp_hidden_states = hidden_states[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size :]
-                dp_out = self._forward_common(layer_name, dp_hidden_states, kv_cache, dp_metadata, need_gather_q_kv, output[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size:])
-        else:
-            self._forward_common(layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output)
-        return output
-
-    def _forward_common(
-        self,
-        layer_name,
-        hidden_states: torch.Tensor,  # query in unified attn
-        kv_cache: Tuple[torch.Tensor],
-        attn_metadata: M,
-        need_gather_q_kv: bool = False,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
         forward_context = get_forward_context()
 
-        logger.info(f"====== attn_metadata.num_actual_tokens_pcp_padded: {attn_metadata.num_actual_tokens_pcp_padded}")
         if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
             num_actual_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
         else:
@@ -500,14 +463,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
-        if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
-            o_proj_input_shape = (num_actual_tokens,
-                              self.num_heads * self.v_head_dim)
-        elif self.pcp_size > 1:
-            o_proj_input_shape = (forward_context.num_tokens - attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size,
-                              self.num_heads * self.v_head_dim)
-        else:
-            o_proj_input_shape = (forward_context.num_tokens,
+        o_proj_input_shape = (forward_context.num_tokens,
                               self.num_heads * self.v_head_dim)
         o_proj_input = torch.empty(o_proj_input_shape,
                                    dtype=hidden_states.dtype,
@@ -547,11 +503,32 @@ class AscendMlaCPImpl(AscendMLAImpl):
             # FIX: aicore move should be also placed on the comm stream in dbo,
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
-            if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
+            # if self.pcp_size > 1:
+            #     output_prefill = self._forward_prefill_cp(
+            #         prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
+            #         prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
+            #         prefill_preprocess_res.value, kv_cache, attn_metadata)
+            # else:
+            #     output_prefill = self._forward_prefill(
+            #         prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
+            #         prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
+            #         prefill_preprocess_res.value, kv_cache, attn_metadata)
+            num_dycp_reqs = attn_metadata.num_dycp_reqs
+            if num_dycp_reqs > 0:
+                num_pcp_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
+                num_pcp_kv_tokens = attn_metadata.num_actual_tokens_pcp_padded
+                dycp_attn_metadata, dp_attn_metadata = split_attn_metadata(attn_metadata, num_pcp_tokens)
+                # logger.info(f"chenxiao--debug dp_attn_metadata:{dp_attn_metadata}")
                 output_prefill = self._forward_prefill_cp(
-                    prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
-                    prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
-                    prefill_preprocess_res.value, kv_cache, attn_metadata)
+                    prefill_preprocess_res.q_nope[:num_pcp_tokens], prefill_preprocess_res.q_pe[:num_pcp_tokens],
+                    prefill_preprocess_res.k_nope[:num_pcp_kv_tokens * self.pcp_size], prefill_preprocess_res.k_pe[:num_pcp_kv_tokens * self.pcp_size],
+                    prefill_preprocess_res.value[:num_pcp_kv_tokens * self.pcp_size], [kv_cache[0][:num_pcp_kv_tokens], kv_cache[1][:num_pcp_kv_tokens]], dycp_attn_metadata)
+                if prefill_preprocess_res.q_nope.shape[0] > num_pcp_tokens:
+                    output_prefill_dp = self._forward_prefill(
+                        prefill_preprocess_res.q_nope[num_pcp_tokens:], prefill_preprocess_res.q_pe[num_pcp_tokens:],
+                        prefill_preprocess_res.k_nope[num_pcp_kv_tokens * self.pcp_size:], prefill_preprocess_res.k_pe[num_pcp_kv_tokens * self.pcp_size:],
+                        prefill_preprocess_res.value[num_pcp_kv_tokens * self.pcp_size:], [kv_cache[0][num_pcp_kv_tokens:], kv_cache[1][num_pcp_kv_tokens:]], dp_attn_metadata)
+                    output_prefill = torch.cat([output_prefill, output_prefill_dp], dim=0)
             else:
                 output_prefill = self._forward_prefill(
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
@@ -576,7 +553,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
             maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
         return output_padded
 
-
     def _mla_preprocess(self, layer_name, hidden_states, kv_cache,
                         attn_metadata, need_gather_q_kv):
         # MLA Preprocess:
@@ -597,6 +573,335 @@ class AscendMlaCPImpl(AscendMLAImpl):
                                dependency=hidden_states,
                                enabled=self.enable_prefetch)
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            q_c, kv_no_split = qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            q_c = self.q_a_layernorm(q_c)
+            # allgather need contiguous data
+            kv_no_split = kv_no_split.contiguous()
+        else:
+            q_c = hidden_states
+            kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        # logger.info(f"======= hidden_states: {hidden_states.shape}")
+        # Process for Flash Comm V1
+        q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            q_c.contiguous(), need_gather_q_kv)
+        kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            kv_no_split.contiguous(), need_gather_q_kv)
+
+        if self.fc2_o_shared_enable and is_hidden_layer(
+                self.vllm_config, self.o_proj):
+            reach_layer_for_shared_weight_series(self.o_proj)
+
+        decode_preprocess_res = None
+        prefill_preprocess_res = None
+        if has_prefill:
+            wait_for_kv_layer_from_connector(layer_name)
+        # Preprocess for decode tokens
+        if has_decode:
+            decode_q_c = q_c[:num_decode_tokens]
+            cos = attn_metadata.decode.cos
+            sin = attn_metadata.decode.sin
+            decode_ql_nope, decode_q_pe = \
+                self._q_proj_and_k_up_proj(decode_q_c)
+            if self.dcp_size > 1:
+                decode_q_no_split = torch.cat([decode_ql_nope, decode_q_pe],
+                                              dim=-1)
+                decode_q_no_split = get_dcp_group().all_gather(
+                    decode_q_no_split, 1)
+                decode_ql_nope, decode_q_pe = decode_q_no_split.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+            decode_slots = attn_metadata.slot_mapping[:num_decode_tokens *
+                                                      self.pcp_size:self.
+                                                      pcp_size]
+            decode_kv_no_split = kv_no_split[:num_decode_tokens]
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
+                decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+            decode_preprocess_res = DecodeMLAPreprocessResult(
+                decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
+        # Preprocess for prefill tokens
+        if has_prefill:
+            num_dycp_reqs = attn_metadata.num_dycp_reqs
+            if self.pcp_size > 1 and num_dycp_reqs:
+                num_actual_cp_tokens = (attn_metadata.num_actual_tokens_pcp_padded
+                                     - self.pcp_size * num_decode_tokens
+                                     ) // self.pcp_size + num_decode_tokens
+                num_actual_tokens = num_actual_cp_tokens + sum(attn_metadata.query_lens[attn_metadata.num_decodes+num_dycp_reqs:attn_metadata.num_prefills])
+                logger.info(f"chenxiao--debug num_actual_cp_tokens in mla cp :{num_actual_cp_tokens}, num_actual_tokens_pcp_padded: {attn_metadata.num_actual_tokens_pcp_padded}, num_decode_tokens: {num_decode_tokens}")
+            logger.info(f"chenxiao--debug num_actual_tokens in mla cp :{num_actual_tokens}")
+            prefill_kv_no_split = kv_no_split[
+                num_decode_tokens:num_actual_tokens]
+            prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
+            prefill_q = self.q_proj(prefill_q_c)[0] \
+                .view(-1, self.num_heads, self.qk_head_dim)
+            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
+            prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
+            if self.pcp_size > 1 and num_dycp_reqs:
+                cos = attn_metadata.prefill.cos[:num_actual_tokens -
+                                                num_decode_tokens]
+                sin = attn_metadata.prefill.sin[:num_actual_tokens -
+                                                num_decode_tokens]
+            else:
+                cos = attn_metadata.prefill.cos
+                sin = attn_metadata.prefill.sin
+            prefill_slots = attn_metadata.slot_mapping[
+                num_decode_tokens:num_actual_tokens]
+            prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
+            if self.pcp_size > 1 and num_dycp_reqs:
+                prefill_kv_no_split = kv_no_split[:num_actual_tokens]
+                kv_c, k_pe = prefill_kv_no_split.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+                assert len(
+                    kv_cache
+                ) > 1, "the number of kv cache should be greater than 1, namely (nope_cache and rope_cache)"
+                kv_c_normed = kv_c_normed.view(
+                    [num_actual_tokens, self.num_kv_heads, -1])
+                k_pe = k_pe.unsqueeze(1)
+                prefill_k_pe = k_pe
+                prefill_k_pe[
+                    num_decode_tokens:num_actual_tokens] = self.rope_single(
+                        prefill_k_pe[num_decode_tokens:num_actual_tokens], cos,
+                        sin)
+                prefill_k_c_normed = kv_c_normed[:num_actual_tokens]
+                prefill_kv_c_k_pe = torch.cat(
+                    [prefill_k_c_normed, prefill_k_pe], dim=-1)
+                
+                logger.info(f"========= prefill_kv_c_k_pe: {prefill_kv_c_k_pe.shape}")
+                if attn_metadata.num_dycp_reqs > 0:
+                    cp_prefill_kv_c_k_pe = get_dycp_group().all_gather(
+                        prefill_kv_c_k_pe[:num_actual_cp_tokens], 0)
+                    prefill_kv_c_k_pe = torch.cat((cp_prefill_kv_c_k_pe, prefill_kv_c_k_pe[num_actual_cp_tokens:]), dim=0)
+                else:
+                    prefill_kv_c_k_pe = get_pcp_group().all_gather(
+                        prefill_kv_c_k_pe, 0)
+                prefill_kv_c_k_pe = torch.index_select(
+                    prefill_kv_c_k_pe, 0, attn_metadata.prefill.pcp_metadata.
+                    pcp_allgather_restore_idx)
+                prefill_kv_c_k_pe = prefill_kv_c_k_pe[num_decode_tokens *
+                                                      self.pcp_size:]
+                prefill_k_c_normed, prefill_k_pe = prefill_kv_c_k_pe.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                kv_c_normed, k_pe = prefill_k_c_normed, prefill_k_pe
+                prefill_k_c_normed = prefill_k_c_normed.squeeze()
+                slot_mapping = attn_metadata.slot_mapping[self.pcp_size *
+                                                          num_decode_tokens:]
+                torch_npu._npu_reshape_and_cache(key=kv_c_normed,
+                                                 value=k_pe,
+                                                 key_cache=kv_cache[0],
+                                                 value_cache=kv_cache[1],
+                                                 slot_indices=slot_mapping)
+            else:
+                prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
+                    prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
+            prefill_k_nope, prefill_value = self.kv_b_proj(
+                prefill_k_c_normed)[0].view(
+                    -1, self.num_heads,
+                    self.qk_nope_head_dim + self.v_head_dim).split(
+                        [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            if not self.pcp_size > 1 or not attn_metadata.num_dycp_reqs:
+                prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
+                                                 self.num_kv_heads, -1)
+            prefill_k_pe = prefill_k_pe.expand(
+                (*prefill_k_nope.shape[:-1], -1))
+            prefill_preprocess_res = PrefillMLAPreprocessResult(
+                prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe,
+                prefill_value)
+        return decode_preprocess_res, prefill_preprocess_res
+
+    # def forward(
+    #     self,
+    #     layer_name,
+    #     hidden_states: torch.Tensor,
+    #     kv_cache: Tuple[torch.Tensor],
+    #     attn_metadata: M,
+    #     need_gather_q_kv: bool = False,
+    #     output: Optional[torch.Tensor] = None,
+    # ) -> torch.Tensor:
+    #     assert output is not None, "Output tensor must be provided."
+        
+    #     if attn_metadata is None:
+    #         # Profiling run.
+    #         if self.fc2_o_shared_enable and is_hidden_layer(
+    #                 self.vllm_config, self.o_proj):
+    #             reach_layer_for_shared_weight_series(self.o_proj)
+    #         return output.fill_(0)
+
+    #     forward_context = get_forward_context()
+        
+    #     # ========== 初始化变量 ==========
+    #     dycp_attn_metadata = None
+    #     dp_attn_metadata = None
+    #     num_dycp_reqs = attn_metadata.num_dycp_reqs
+        
+    #     # ========== 切分 Metadata ==========
+    #     if num_dycp_reqs > 0:
+    #         dycp_attn_metadata, dp_attn_metadata = split_attn_metadata(
+    #             attn_metadata, num_dycp_reqs)
+
+    #     # ========== 计算各个部分的 token 数量 ==========
+    #     num_decode_tokens = attn_metadata.num_decode_tokens
+        
+    #     # DYCP decode tokens (如果有)
+    #     dycp_decode_tokens = 0
+    #     if dycp_attn_metadata is not None and dycp_attn_metadata.decode is not None:
+    #         dycp_decode_tokens = dycp_attn_metadata.num_decode_tokens
+        
+    #     # DP decode tokens
+    #     dp_decode_tokens = 0
+    #     if dp_attn_metadata is not None and dp_attn_metadata.decode is not None:
+    #         dp_decode_tokens = dp_attn_metadata.num_decode_tokens
+
+    #     dycp_prefill_tokens = dycp_attn_metadata.num_actual_tokens if dycp_attn_metadata is not None else 0
+    #     dp_start_idx = num_decode_tokens + dycp_prefill_tokens
+    #     # ========== 处理 DP 部分（走父类 forward）==========
+    #     if dp_attn_metadata is not None and attn_metadata.num_actual_tokens > dp_start_idx:
+    #         logger.info(f"chenxiao--debug start attn_metadata.num_actual_tokens:{attn_metadata.num_actual_tokens}")
+    #         dp_hidden_states = hidden_states[dp_start_idx:]
+            
+    #         # 为 DP 部分分配独立的 output buffer
+    #         dp_output = torch.empty(
+    #             dp_attn_metadata.num_actual_tokens,
+    #             self.num_heads * self.v_head_dim,
+    #             dtype=hidden_states.dtype,
+    #             device=hidden_states.device,
+    #         )
+            
+    #         # 调用父类 forward
+    #         dp_output = super().forward(
+    #             layer_name,
+    #             dp_hidden_states,
+    #             kv_cache,
+    #             dp_attn_metadata,
+    #             need_gather_q_kv,
+    #             output=dp_output,
+    #         )
+    #         logger.info(f"chenxiao--debug endattn_metadata.num_actual_tokens:{attn_metadata.num_actual_tokens}")
+    #         logger.info(f"chenxiao--debug dp_start_idx:{dp_start_idx}")
+    #         output[dp_start_idx:attn_metadata.num_actual_tokens] = dp_output
+
+    #     if dycp_attn_metadata is None:
+    #         return output
+    #     else:
+    #         attn_metadata = dycp_attn_metadata
+    #         # DYCP 部分的 hidden_states: decode + prefill
+    #         dycp_end_idx = num_decode_tokens + dycp_attn_metadata.num_actual_tokens
+    #         hidden_states = hidden_states[:dycp_end_idx]
+            
+    #         # DYCP 部分的 output buffer
+    #         dycp_output = torch.empty(
+    #             dycp_end_idx,
+    #             self.num_heads * self.v_head_dim,
+    #             dtype=hidden_states.dtype,
+    #             device=hidden_states.device,
+    #         )
+
+    #     if self.pcp_size > 1:
+    #         num_actual_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
+    #     else:
+    #         num_actual_tokens = attn_metadata.num_actual_tokens
+    #     assert attn_metadata.num_decodes is not None and \
+    #            attn_metadata.num_prefills is not None and \
+    #            attn_metadata.num_decode_tokens is not None
+
+    #     has_prefill = attn_metadata.num_prefills > 0
+    #     num_decode_tokens = attn_metadata.num_decode_tokens
+    #     # Inputs and outputs may be padded for CUDA graphs
+    #     output_padded = dycp_output
+    #     o_proj_input_shape = (forward_context.num_tokens,
+    #                           self.num_heads * self.v_head_dim)
+    #     o_proj_input = torch.empty(o_proj_input_shape,
+    #                                dtype=hidden_states.dtype,
+    #                                device=hidden_states.device)
+
+    #     # MLA Preprocess
+    #     if self.enable_mlapo and not has_prefill:
+    #         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+    #             hidden_states.contiguous(), need_gather_q_kv)
+    #         decode_preprocess_res, prefill_preprocess_res = self._mla_decode_preprocess(
+    #             hidden_states, kv_cache, attn_metadata)
+    #     else:
+    #         decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
+    #             layer_name, hidden_states, kv_cache, attn_metadata,
+    #             need_gather_q_kv)
+
+    #     if decode_preprocess_res is not None:
+    #         # MLA Preprocess for decoding
+    #         if self.pcp_size * self.dcp_size * self.dycp_size > 1:
+    #             output_decode = self._forward_decode_pcp_dcp(
+    #                 decode_preprocess_res.ql_nope,
+    #                 decode_preprocess_res.q_pe,
+    #                 decode_preprocess_res.k_nope,
+    #                 decode_preprocess_res.k_pe,
+    #                 kv_cache[0].shape[1],
+    #                 attn_metadata,
+    #             )
+    #         else:
+    #             output_decode = self._forward_decode(
+    #                 decode_preprocess_res.ql_nope, decode_preprocess_res.q_pe,
+    #                 decode_preprocess_res.k_nope, decode_preprocess_res.k_pe,
+    #                 kv_cache[0].shape[1], attn_metadata)
+
+    #         o_proj_input[:num_decode_tokens] = output_decode
+
+    #     if prefill_preprocess_res is not None:
+    #         # FIX: aicore move should be also placed on the comm stream in dbo,
+    #         # otherwise it may affect the accuracy
+    #         # TODO: use an elegant way to overlap
+    #         if self.pcp_size > 1:
+    #             output_prefill = self._forward_prefill_cp(
+    #                 prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
+    #                 prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
+    #                 prefill_preprocess_res.value, kv_cache, attn_metadata)
+    #         else:
+    #             output_prefill = self._forward_prefill(
+    #                 prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
+    #                 prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
+    #                 prefill_preprocess_res.value, kv_cache, attn_metadata)
+
+    #         o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+    #     # O proj
+    #     MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
+    #     maybe_npu_prefetch(inputs=self.o_proj.weight,
+    #                        dependency=o_proj_input,
+    #                        max_size=MAX_O_PROJ_PREFETCH_SIZE,
+    #                        enabled=self.enable_prefetch)
+
+    #     dycp_output[...] = self.o_proj(o_proj_input,
+    #                               is_prefill=(prefill_preprocess_res
+    #                                           is not None))[0]
+    #     del o_proj_input
+
+    #     if has_prefill:
+    #         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+    #     output[:dycp_end_idx] = output_padded
+    #     return output
+
+    def _mla_preprocess(self, layer_name, hidden_states, kv_cache,
+                        attn_metadata, need_gather_q_kv):
+        # MLA Preprocess:
+        # 1. Perform fused_qkv_a_proj and q_a_layernorm to obtain q_c and kv_no_split
+        # or
+        #    Perform kv_a_proj_with_mqa to obtain kv_no_split
+        # 2. If need_gather_q_kv, perform all_gather.
+        # 3. Preprocess decode tokens, write kv cache and get:
+        # decode_ql_nope, decode_q_pe, decode_k_pe, decode_k_nope
+        # 4. Preprocess prefill tokens, write kv cache and get:
+        # prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value
+        has_decode = attn_metadata.num_decodes > 0
+        has_prefill = attn_metadata.num_prefills > 0
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if self.fused_qkv_a_proj is not None:
+            maybe_npu_prefetch(inputs=self.fused_qkv_a_proj.weight,
+                               dependency=hidden_states,
+                               enabled=self.enable_prefetch)
+            aa = self.fused_qkv_a_proj(hidden_states)
+            qkv_lora = aa[0]
+            logger.info(f"========= hidden_states: {hidden_states.shape}, qkv_lora: {qkv_lora.shape}, aa: {aa.shape}")
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -647,7 +952,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
         # Preprocess for prefill tokens
         if has_prefill:
-            if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
+            if self.pcp_size > 1:
                 num_actual_tokens = (attn_metadata.num_actual_tokens_pcp_padded
                                      - self.pcp_size * num_decode_tokens
                                      ) // self.pcp_size + num_decode_tokens
@@ -658,7 +963,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 .view(-1, self.num_heads, self.qk_head_dim)
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
             prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
-            if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
+            if self.pcp_size > 1:
                 cos = attn_metadata.prefill.cos[:num_actual_tokens -
                                                 num_decode_tokens]
                 sin = attn_metadata.prefill.sin[:num_actual_tokens -
@@ -669,7 +974,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             prefill_slots = attn_metadata.slot_mapping[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
-            if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
+            if self.pcp_size > 1:
                 prefill_kv_no_split = kv_no_split[:num_actual_tokens]
                 kv_c, k_pe = prefill_kv_no_split.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -701,14 +1006,12 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 prefill_k_c_normed = prefill_k_c_normed.squeeze()
                 slot_mapping = attn_metadata.slot_mapping[self.pcp_size *
                                                           num_decode_tokens:]
-                logger.info(f"===== kv_c_normed: {kv_c_normed.shape}, k_pe: {k_pe.shape}, kv_cache[0]: {kv_cache[0].shape}, slot_mapping: {slot_mapping}")
                 torch_npu._npu_reshape_and_cache(key=kv_c_normed,
                                                  value=k_pe,
                                                  key_cache=kv_cache[0],
                                                  value_cache=kv_cache[1],
                                                  slot_indices=slot_mapping)
             else:
-                logger.info(f"======= dp prefill_slots: {prefill_slots}")
                 prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                     prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
             prefill_k_nope, prefill_value = self.kv_b_proj(
@@ -716,7 +1019,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     -1, self.num_heads,
                     self.qk_nope_head_dim + self.v_head_dim).split(
                         [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            if not (self.pcp_size > 1 and attn_metadata.num_dycp_reqs):
+            if not self.pcp_size > 1:
                 prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
                                                  self.num_kv_heads, -1)
             prefill_k_pe = prefill_k_pe.expand(
@@ -1194,7 +1497,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
 def split_attn_metadata(
     attn_metadata: AscendMLAMetadata,
     num_dycp_reqs: int,
-    dycp_cp_size: int,
 ) -> Tuple[AscendMLAMetadata, AscendMLAMetadata]:
     """
     将 AscendMLAMetadata 切分为 DYCP 和 DP 两部分。
@@ -1209,34 +1511,31 @@ def split_attn_metadata(
     prefill_meta = attn_metadata.prefill
     num_prefills = attn_metadata.num_prefills
     
-    if num_dycp_reqs == 0:
-        return None, attn_metadata
-    if num_dycp_reqs >= num_prefills:
-        return attn_metadata, None
+    # if num_dycp_reqs == 0:
+    #     return None, attn_metadata
+    # if num_dycp_reqs >= num_prefills:
+    #     return attn_metadata, None
     
     # ========== 1. 计算 token 切分位置 ==========
     if isinstance(prefill_meta.query_lens, torch.Tensor):
         dycp_token_num = prefill_meta.query_lens[:num_dycp_reqs].sum().item()
     else:
         dycp_token_num = sum(prefill_meta.query_lens[:num_dycp_reqs])
-    logger.info(f"chenxiao--debug dycp_token_num:{dycp_token_num}")
     
     # ========== 2. 切分 prefill metadata ==========
     dycp_prefill, dp_prefill = split_prefill_metadata(
-        prefill_meta, num_dycp_reqs, dycp_token_num, dycp_cp_size
+        prefill_meta, num_dycp_reqs, dycp_token_num
     )
     
     # ========== 3. 切分顶层 metadata 的字段 ==========
     
     # slot_mapping (Tensor)
-    dycp_slot_mapping = attn_metadata.slot_mapping[:dycp_token_num*dycp_cp_size]
-    dp_slot_mapping = attn_metadata.slot_mapping[dycp_token_num*dycp_cp_size:]
-    logger.info(f"==== origin slot_mapping: {attn_metadata.slot_mapping}, dycp_slot_mapping: {dycp_slot_mapping}, dp_slot_mapping: {dp_slot_mapping}")
+    dycp_slot_mapping = attn_metadata.slot_mapping[:dycp_token_num]
+    dp_slot_mapping = attn_metadata.slot_mapping[dycp_token_num:]
     
     # query_start_loc (Tensor)
     dycp_query_start_loc = attn_metadata.query_start_loc[:num_dycp_reqs + 1]
     dp_query_start_loc = attn_metadata.query_start_loc[num_dycp_reqs:] - dycp_token_num
-    logger.info(f"chenxiao--debug dycp_query_start_loc: {dycp_query_start_loc}, dp_query_start_loc:{dp_query_start_loc}")
     
     # seq_lens (Tensor)
     dycp_seq_lens = attn_metadata.seq_lens[:num_dycp_reqs]
@@ -1245,15 +1544,15 @@ def split_attn_metadata(
     # block_tables (Tensor)
     dycp_block_tables = attn_metadata.block_tables[:num_dycp_reqs]
     dp_block_tables = attn_metadata.block_tables[num_dycp_reqs:]
+    
     # query_lens (list)
     dycp_query_lens = attn_metadata.query_lens[:num_dycp_reqs]
     dp_query_lens = attn_metadata.query_lens[num_dycp_reqs:]
-    logger.info(f"chenxiao--debug dycp_query_lens:{dycp_query_lens}, dp_query_lens:{dp_query_lens}")
     
     # ========== 4. 构建新的 metadata ==========
     dycp_metadata = AscendMLAMetadata(
         num_actual_tokens_pcp_padded=attn_metadata.num_actual_tokens_pcp_padded,
-        num_actual_tokens=dycp_token_num*dycp_cp_size,
+        num_actual_tokens=dycp_token_num,
         slot_mapping=dycp_slot_mapping,
         query_start_loc=dycp_query_start_loc,
         seq_lens=dycp_seq_lens,
@@ -1267,12 +1566,11 @@ def split_attn_metadata(
         attn_mask=prefill_meta.attn_mask[:dycp_token_num],
         attn_state=attn_metadata.attn_state,
         decode=None,
-        prefill=dycp_prefill,
+        prefill=attn_metadata.prefill,
         num_dycp_reqs=num_dycp_reqs,
     )
     
-    dp_token_num = attn_metadata.num_actual_tokens - dycp_token_num*dycp_cp_size
-    logger.info(f"chenxiao--debug dp_token_num:{dp_token_num}")
+    dp_token_num = attn_metadata.num_actual_tokens - dycp_token_num
     dp_metadata = AscendMLAMetadata(
         num_actual_tokens_pcp_padded=attn_metadata.num_actual_tokens_pcp_padded,
         num_actual_tokens=dp_token_num,
@@ -1289,7 +1587,7 @@ def split_attn_metadata(
         attn_mask=prefill_meta.attn_mask[dycp_token_num:],
         attn_state=attn_metadata.attn_state,
         decode=None,
-        prefill=dp_prefill,
+        prefill=attn_metadata.prefill,
         num_dycp_reqs=0,
     )
     
@@ -1300,7 +1598,6 @@ def split_prefill_metadata(
     prefill_meta: AscendMLAPrefillMetadata,
     num_dycp_reqs: int,
     dycp_token_num: int,
-    dycp_cp_size: int,
 ) -> Tuple[AscendMLAPrefillMetadata, AscendMLAPrefillMetadata]:
     """切分 AscendMLAPrefillMetadata"""
     
@@ -1337,10 +1634,10 @@ def split_prefill_metadata(
     dp_attn_mask = prefill_meta.attn_mask[dycp_token_num:]
     
     # ========== 处理 sin/cos (Tensor) ==========
-    dycp_sin = prefill_meta.sin[:dycp_token_num*dycp_cp_size] if prefill_meta.sin is not None else None
-    dp_sin = prefill_meta.sin[dycp_token_num*dycp_cp_size:] if prefill_meta.sin is not None else None
-    dycp_cos = prefill_meta.cos[:dycp_token_num*dycp_cp_size] if prefill_meta.cos is not None else None
-    dp_cos = prefill_meta.cos[dycp_token_num*dycp_cp_size:] if prefill_meta.cos is not None else None
+    dycp_sin = prefill_meta.sin[:dycp_token_num] if prefill_meta.sin is not None else None
+    dp_sin = prefill_meta.sin[dycp_token_num:] if prefill_meta.sin is not None else None
+    dycp_cos = prefill_meta.cos[:dycp_token_num] if prefill_meta.cos is not None else None
+    dp_cos = prefill_meta.cos[dycp_token_num:] if prefill_meta.cos is not None else None
     
     # ========== 处理 max_query_len / max_seq_lens ==========
     if isinstance(dycp_query_lens, torch.Tensor):
