@@ -575,6 +575,7 @@ class NPUModelRunner(GPUModelRunner):
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        logger.info(f"===== req_ids: {req_ids}, scheduler_output.num_scheduled_tokens: {num_scheduled_tokens}")
 
         req_indices = np.repeat(self.arange_np[:num_reqs],
                                 num_scheduled_tokens)
@@ -584,7 +585,7 @@ class NPUModelRunner(GPUModelRunner):
             arange,
         )
         num_cp_request = 0
-        if scheduler_output.num_cp_request is not None:
+        if self.dycp_size > 1:
             num_cp_request = scheduler_output.num_cp_request
         elif self.pcp_size > 1:
             num_cp_request = num_reqs
@@ -687,8 +688,10 @@ class NPUModelRunner(GPUModelRunner):
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices[: total_num_pcp_scheduled_tokens]],
                    position_pcp[:total_num_pcp_scheduled_tokens],
                    out=tmp_positions_np[: total_num_pcp_scheduled_tokens])
-            tmp_positions_np[total_num_pcp_scheduled_tokens: total_num_scheduled_tokens] = positions_np[total_num_pcp_scheduled_tokens: total_num_scheduled_tokens]
+            tmp_positions_np[total_num_pcp_scheduled_tokens: total_num_scheduled_tokens] = positions_np[total_num_pcp_scheduled_tokens * self.pcp_size - total_num_pcp_pads:]
+            
             positions_np = tmp_positions_np
+            logger.info(f"====== num_cp_request: {num_cp_request}, num_scheduled_tokens: {num_scheduled_tokens}, tmp_positions_np: {tmp_positions_np}")
         else:
             self.positions.np[:total_num_scheduled_tokens] = positions_np
 
@@ -1083,6 +1086,7 @@ class NPUModelRunner(GPUModelRunner):
                 # prepare_inputs for uniform decode mode by padding query_start_loc
                 num_reqs = num_reqs_padded
 
+            logger.info(f"======= model runner self.attn_mask: {self.attn_mask}")
             # Make AscendCommonAttentionMetadata
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
@@ -1242,6 +1246,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.pcp_size > 1:
             dp_hidden_states = hidden_states[self.num_actual_tokens_pcp_padded // self.pcp_size :]
+            logger.info(f"======== dp_hidden_states: {dp_hidden_states}")
             if num_cp_request > 0:
                 if self.dycp_size > 1:
                     cp_hidden_states = get_dycp_group().all_gather(
@@ -1251,9 +1256,12 @@ class NPUModelRunner(GPUModelRunner):
                     cp_hidden_states = get_pcp_group().all_gather(
                         hidden_states[:self.num_actual_tokens_pcp_padded //
                                     self.pcp_size], 0)
-                    cp_hidden_states[: self.num_actual_tokens_pcp_padded] = torch.index_select(
-                        cp_hidden_states, 0, self.pcp_allgather_restore_idx[:cp_hidden_states.shape[0]])
+                logger.info(f"======== cp_hidden_states: {cp_hidden_states}")
+                cp_hidden_states[: self.num_actual_tokens_pcp_padded] = torch.index_select(
+                    cp_hidden_states, 0, self.pcp_allgather_restore_idx[:cp_hidden_states.shape[0]])
+                logger.info(f"======== cp_hidden_states: {cp_hidden_states}")
                 dp_hidden_states = torch.cat([cp_hidden_states, dp_hidden_states])
+                logger.info(f"======== final dp_hidden_states: {dp_hidden_states}")
             hidden_states = dp_hidden_states
         return hidden_states
 

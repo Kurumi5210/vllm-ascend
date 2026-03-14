@@ -40,6 +40,7 @@ MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 
 M = TypeVar("M", bound=AscendMLAMetadata)
 
+STEP = 1
 
 class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
     # Does this backend/builder support ACL Graphs for attention (default: no).
@@ -448,30 +449,21 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     self.vllm_config, self.o_proj):
                 reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
-
+        dp_token_num = attn_metadata.num_actual_tokens - attn_metadata.num_actual_tokens_pcp_padded
+        padded_num = hidden_states.shape[0] - attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size - dp_token_num
         num_decode_tokens = attn_metadata.num_decode_tokens
         if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
             dycp_metadata, dp_metadata = split_attn_metadata(attn_metadata, attn_metadata.num_dycp_reqs, self.dycp_size)
             
             if dycp_metadata:
-                logger.info(f"====== dycp_metadata.num_actual_tokens: {dycp_metadata.num_actual_tokens}")
-                # dycp_output = torch.empty(
-                #     attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size,
-                #     output.shape[1],
-                #     dtype=hidden_states.dtype,
-                #     device=hidden_states.device,
-                # )
                 cp_hidden_states = hidden_states[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size]
-                co_out = self._forward_common(layer_name, cp_hidden_states, kv_cache, dycp_metadata, need_gather_q_kv, output[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size])
+                self._forward_common(layer_name, cp_hidden_states, kv_cache, dycp_metadata, need_gather_q_kv, output[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size])
             if dp_metadata:
-                # dp_output = torch.empty(
-                #     dp_metadata.num_actual_tokens,
-                #     output.shape[1],
-                #     dtype=hidden_states.dtype,
-                #     device=hidden_states.device,
-                # )
-                dp_hidden_states = hidden_states[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size :]
-                dp_out = self._forward_common(layer_name, dp_hidden_states, kv_cache, dp_metadata, need_gather_q_kv, output[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size:])
+                # global STEP
+                # torch.save(hidden_states, f"/home/wgh/scripts/value/hidden_states_{STEP}_pcp_{self.pcp_rank}.pt")
+                # STEP += 1
+                dp_hidden_states = hidden_states[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size - padded_num : num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size - padded_num + dp_token_num]
+                self._forward_common(layer_name, dp_hidden_states, kv_cache, dp_metadata, need_gather_q_kv, output[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size:])
         else:
             self._forward_common(layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output)
         return output
@@ -486,8 +478,8 @@ class AscendMlaCPImpl(AscendMLAImpl):
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         forward_context = get_forward_context()
-
-        logger.info(f"====== attn_metadata.num_actual_tokens_pcp_padded: {attn_metadata.num_actual_tokens_pcp_padded}")
+        if attn_metadata.num_dycp_reqs == 0:
+            logger.info(f"========== hidden_states: {hidden_states.shape}:{hidden_states}")
         if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
             num_actual_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
         else:
@@ -557,7 +549,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
                     prefill_preprocess_res.value, kv_cache, attn_metadata)
-
+                logger.info(f"========= dp output_prefill: {output_prefill}")
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         # O proj
         MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
@@ -613,7 +605,9 @@ class AscendMlaCPImpl(AscendMLAImpl):
             q_c.contiguous(), need_gather_q_kv)
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv_no_split.contiguous(), need_gather_q_kv)
-
+        if attn_metadata.num_dycp_reqs == 0:
+            logger.info(f"====== q_c: {q_c}")
+        
         if self.fc2_o_shared_enable and is_hidden_layer(
                 self.vllm_config, self.o_proj):
             reach_layer_for_shared_weight_series(self.o_proj)
@@ -701,14 +695,12 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 prefill_k_c_normed = prefill_k_c_normed.squeeze()
                 slot_mapping = attn_metadata.slot_mapping[self.pcp_size *
                                                           num_decode_tokens:]
-                logger.info(f"===== kv_c_normed: {kv_c_normed.shape}, k_pe: {k_pe.shape}, kv_cache[0]: {kv_cache[0].shape}, slot_mapping: {slot_mapping}")
                 torch_npu._npu_reshape_and_cache(key=kv_c_normed,
                                                  value=k_pe,
                                                  key_cache=kv_cache[0],
                                                  value_cache=kv_cache[1],
                                                  slot_indices=slot_mapping)
             else:
-                logger.info(f"======= dp prefill_slots: {prefill_slots}")
                 prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                     prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
             prefill_k_nope, prefill_value = self.kv_b_proj(
@@ -1264,7 +1256,7 @@ def split_attn_metadata(
         num_input_tokens=dycp_token_num,
         query_lens=dycp_query_lens,
         head_dim=attn_metadata.head_dim,
-        attn_mask=prefill_meta.attn_mask[:dycp_token_num],
+        attn_mask=attn_metadata.attn_mask,
         attn_state=attn_metadata.attn_state,
         decode=None,
         prefill=dycp_prefill,
@@ -1286,7 +1278,7 @@ def split_attn_metadata(
         num_input_tokens=dp_token_num,
         query_lens=dp_query_lens,
         head_dim=attn_metadata.head_dim,
-        attn_mask=prefill_meta.attn_mask[dycp_token_num:],
+        attn_mask=attn_metadata.attn_mask,
         attn_state=attn_metadata.attn_state,
         decode=None,
         prefill=dp_prefill,
@@ -1312,6 +1304,11 @@ def split_prefill_metadata(
         dycp_query_lens = prefill_meta.query_lens[:num_dycp_reqs]
         dp_query_lens = prefill_meta.query_lens[num_dycp_reqs:]
     
+    if isinstance(prefill_meta.query_lens, torch.Tensor):
+        dp_token_num = prefill_meta.query_lens[num_dycp_reqs:].sum().item()
+    else:
+        dp_token_num = sum(prefill_meta.query_lens[num_dycp_reqs:])
+
     # ========== 处理 seq_lens (list) ==========
     dycp_seq_lens = prefill_meta.seq_lens[:num_dycp_reqs]
     dp_seq_lens = prefill_meta.seq_lens[num_dycp_reqs:]
@@ -1337,10 +1334,10 @@ def split_prefill_metadata(
     dp_attn_mask = prefill_meta.attn_mask[dycp_token_num:]
     
     # ========== 处理 sin/cos (Tensor) ==========
-    dycp_sin = prefill_meta.sin[:dycp_token_num*dycp_cp_size] if prefill_meta.sin is not None else None
-    dp_sin = prefill_meta.sin[dycp_token_num*dycp_cp_size:] if prefill_meta.sin is not None else None
-    dycp_cos = prefill_meta.cos[:dycp_token_num*dycp_cp_size] if prefill_meta.cos is not None else None
-    dp_cos = prefill_meta.cos[dycp_token_num*dycp_cp_size:] if prefill_meta.cos is not None else None
+    dycp_sin = prefill_meta.sin[:dycp_token_num] if prefill_meta.sin is not None else None
+    dp_sin = prefill_meta.sin[dycp_token_num: dycp_token_num + dp_token_num] if prefill_meta.sin is not None else None
+    dycp_cos = prefill_meta.cos[:dycp_token_num] if prefill_meta.cos is not None else None
+    dp_cos = prefill_meta.cos[dycp_token_num: dycp_token_num + dp_token_num] if prefill_meta.cos is not None else None
     
     # ========== 处理 max_query_len / max_seq_lens ==========
     if isinstance(dycp_query_lens, torch.Tensor):
