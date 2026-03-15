@@ -430,7 +430,6 @@ class AscendMLAMetadataBuilder:
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         self.query_lens = query_seq_lens_cpu[:num_reqs]
         self.seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
-        # logger.info(f"chenxiao--debug begin self.seq_lens:{self.seq_lens}")
         if self.dycp_size > 1:
             num_dycp_reqs = common_attn_metadata.num_dycp_reqs
             dycp_local = get_dcp_local_seq_lens(
@@ -440,7 +439,6 @@ class AscendMLAMetadataBuilder:
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             )
             self.seq_lens[:num_dycp_reqs] = dycp_local
-        # logger.info(f"chenxiao--debug after self.seq_lens:{self.seq_lens}")
         self.set_prefill_block_table(common_attn_metadata)
 
         prefill_metadata = None
@@ -572,7 +570,6 @@ class AscendMLAMetadataBuilder:
         sin = self.sin_cache[
             prefill_input_positions].unsqueeze(  # type: ignore
                 1).unsqueeze(2)
-        logger.info(f"========= prefill_input_positions: {prefill_input_positions}, cos: {cos}, self.num_actual_tokens: {self.num_actual_tokens}")
         return AscendMLAPrefillMetadata(
             attn_mask=common_attn_metadata.attn_mask,
             query_lens=self.query_lens[reqs_start:].to(torch.int32),
@@ -1091,8 +1088,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                                    calc_type="calc_type_first_ring",
                                    output=attn_output,
                                    softmax_lse=attn_lse)
-        logger.info(f"====== num_tokens: {num_tokens}, query_lens: {attn_metadata.prefill.query_lens}, attn_mask: {attn_metadata.attn_mask}, q_nope: {q_nope}, q_pe: {q_pe}, k_nope: {k_nope}, k_pe: {k_pe}, value: {value}")
-        logger.info(f"====== attn_output: {attn_output}, attn_lse: {attn_lse}")
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim,
             attn_metadata, attn_output, attn_lse)
@@ -1141,7 +1136,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         N = self.num_kv_heads
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
-        logger.info(f"=== slots: {slots}, kv_no_split: {kv_no_split}, cos: {cos}, sin: {sin}")
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
@@ -1157,7 +1151,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             cache_mode=cache_mode,
             is_output_kv=True,
         )
-        logger.info(f"========= dp exec_kv_prefill, k_pe: {k_pe}, k_nope: {k_nope}, kv_cache[0]: {kv_cache[0]}")
         return k_pe, k_nope
 
     def rope_single(

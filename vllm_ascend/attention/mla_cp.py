@@ -40,7 +40,6 @@ MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 
 M = TypeVar("M", bound=AscendMLAMetadata)
 
-STEP = 1
 
 class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
     # Does this backend/builder support ACL Graphs for attention (default: no).
@@ -449,8 +448,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     self.vllm_config, self.o_proj):
                 reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
-        dp_token_num = attn_metadata.num_actual_tokens - attn_metadata.num_actual_tokens_pcp_padded
-        padded_num = hidden_states.shape[0] - attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size - dp_token_num
         num_decode_tokens = attn_metadata.num_decode_tokens
         if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
             dycp_metadata, dp_metadata = split_attn_metadata(attn_metadata, attn_metadata.num_dycp_reqs, self.dycp_size)
@@ -459,10 +456,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 cp_hidden_states = hidden_states[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size]
                 self._forward_common(layer_name, cp_hidden_states, kv_cache, dycp_metadata, need_gather_q_kv, output[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size])
             if dp_metadata:
-                # global STEP
-                # torch.save(hidden_states, f"/home/wgh/scripts/value/hidden_states_{STEP}_pcp_{self.pcp_rank}.pt")
-                # STEP += 1
-                dp_hidden_states = hidden_states[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size - padded_num : num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size - padded_num + dp_token_num]
+                dp_hidden_states = hidden_states[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size :]
                 self._forward_common(layer_name, dp_hidden_states, kv_cache, dp_metadata, need_gather_q_kv, output[num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size:])
         else:
             self._forward_common(layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output)
@@ -478,8 +472,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         forward_context = get_forward_context()
-        if attn_metadata.num_dycp_reqs == 0:
-            logger.info(f"========== hidden_states: {hidden_states.shape}:{hidden_states}")
         if self.pcp_size > 1 and attn_metadata.num_dycp_reqs:
             num_actual_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
         else:
@@ -549,7 +541,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
                     prefill_preprocess_res.value, kv_cache, attn_metadata)
-                logger.info(f"========= dp output_prefill: {output_prefill}")
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         # O proj
         MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
@@ -605,8 +596,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
             q_c.contiguous(), need_gather_q_kv)
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv_no_split.contiguous(), need_gather_q_kv)
-        if attn_metadata.num_dycp_reqs == 0:
-            logger.info(f"====== q_c: {q_c}")
         
         if self.fc2_o_shared_enable and is_hidden_layer(
                 self.vllm_config, self.o_proj):
@@ -946,10 +935,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
             seq_len = attn_metadata.seq_lens
         else:
             seq_len = decode_meta.cp_seq_len
-        # logger.info(f"chenxiao--debug seq_len:{seq_len}")
-        # logger.info(f"chenxiao--debug block table : {decode_meta.block_table.shape}")
-        # logger.info(f"chenxiao--debug decode_meta.block_table:{decode_meta.block_table}")
-        # logger.info(f"chenxiao--debug num block :{torch.count_nonzero(decode_meta.block_table[0]).item()}")
         common_kwargs = {
             "return_lse": True,
             "calc_type": "calc_type_ring",
@@ -1023,7 +1008,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
         attn_out_lse = self._process_attn_out_lse(attn_output, softmax_lse,
                                                   decode_meta, attn_metadata.num_dycp_reqs)
         if attn_metadata.num_dycp_reqs > 0:
-            # logger.info(f"chenxiao--debug attn_out_lse:{attn_out_lse.shape}")
             return self._v_up_proj(attn_out_lse)
         attn_output = self._npu_attention_update(attn_out_lse)
         return self._v_up_proj(attn_output)
@@ -1091,9 +1075,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                                    group=self.dcp_group)
             attn_out_lse = attn_out_lse_all2all.permute([2, 0, 1])
         from vllm.logger import logger
-        # logger.info(f"chenxiao--debug num_dycp_reqs:{num_dycp_reqs}")
         if num_dycp_reqs > 0:
-            # logger.info(f"chenxiao--debug start process lse!!!!")
             lse_exp = torch.exp(softmax_lse[:num_dycp_reqs])   # [bs, num_heads, 1]
             weighted_output = attn_output[:num_dycp_reqs] * lse_exp  # [bs, num_heads, v_head_dim]
             get_dycp_group().all_reduce(lse_exp)
@@ -1211,7 +1193,6 @@ def split_attn_metadata(
         dycp_token_num = prefill_meta.query_lens[:num_dycp_reqs].sum().item()
     else:
         dycp_token_num = sum(prefill_meta.query_lens[:num_dycp_reqs])
-    logger.info(f"chenxiao--debug dycp_token_num:{dycp_token_num}")
     
     # ========== 2. 切分 prefill metadata ==========
     dycp_prefill, dp_prefill = split_prefill_metadata(
@@ -1223,12 +1204,10 @@ def split_attn_metadata(
     # slot_mapping (Tensor)
     dycp_slot_mapping = attn_metadata.slot_mapping[:dycp_token_num*dycp_cp_size]
     dp_slot_mapping = attn_metadata.slot_mapping[dycp_token_num*dycp_cp_size:]
-    logger.info(f"==== origin slot_mapping: {attn_metadata.slot_mapping}, dycp_slot_mapping: {dycp_slot_mapping}, dp_slot_mapping: {dp_slot_mapping}")
     
     # query_start_loc (Tensor)
     dycp_query_start_loc = attn_metadata.query_start_loc[:num_dycp_reqs + 1]
     dp_query_start_loc = attn_metadata.query_start_loc[num_dycp_reqs:] - dycp_token_num
-    logger.info(f"chenxiao--debug dycp_query_start_loc: {dycp_query_start_loc}, dp_query_start_loc:{dp_query_start_loc}")
     
     # seq_lens (Tensor)
     dycp_seq_lens = attn_metadata.seq_lens[:num_dycp_reqs]
@@ -1240,7 +1219,6 @@ def split_attn_metadata(
     # query_lens (list)
     dycp_query_lens = attn_metadata.query_lens[:num_dycp_reqs]
     dp_query_lens = attn_metadata.query_lens[num_dycp_reqs:]
-    logger.info(f"chenxiao--debug dycp_query_lens:{dycp_query_lens}, dp_query_lens:{dp_query_lens}")
     
     # ========== 4. 构建新的 metadata ==========
     dycp_metadata = AscendMLAMetadata(
@@ -1264,7 +1242,6 @@ def split_attn_metadata(
     )
     
     dp_token_num = attn_metadata.num_actual_tokens - dycp_token_num*dycp_cp_size
-    logger.info(f"chenxiao--debug dp_token_num:{dp_token_num}")
     dp_metadata = AscendMLAMetadata(
         num_actual_tokens_pcp_padded=attn_metadata.num_actual_tokens_pcp_padded,
         num_actual_tokens=dp_token_num,
