@@ -390,6 +390,12 @@ class AscendMLAMetadataBuilder:
     ):
         self.num_actual_tokens = common_attn_metadata.num_actual_tokens
 
+    def get_num_actual_tokens_pcp_padded(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ):
+        return common_attn_metadata.num_actual_tokens
+
     def build(
         self,
         common_prefix_len: int,
@@ -424,7 +430,6 @@ class AscendMLAMetadataBuilder:
         query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         self.query_lens = query_seq_lens_cpu[:num_reqs]
         self.seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
-        # logger.info(f"chenxiao--debug begin self.seq_lens:{self.seq_lens}")
         if self.dycp_size > 1:
             num_dycp_reqs = common_attn_metadata.num_dycp_reqs
             dycp_local = get_dcp_local_seq_lens(
@@ -434,7 +439,6 @@ class AscendMLAMetadataBuilder:
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             )
             self.seq_lens[:num_dycp_reqs] = dycp_local
-        # logger.info(f"chenxiao--debug after self.seq_lens:{self.seq_lens}")
         self.set_prefill_block_table(common_attn_metadata)
 
         prefill_metadata = None
@@ -448,7 +452,7 @@ class AscendMLAMetadataBuilder:
                 common_prefix_len, common_attn_metadata, model)
 
         return self.metadata_cls(  # type: ignore
-            num_actual_tokens_pcp_padded=self.num_actual_tokens,
+            num_actual_tokens_pcp_padded=self.get_num_actual_tokens_pcp_padded(common_attn_metadata),
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=self.num_actual_tokens,
             query_lens=self.query_lens.tolist(),
