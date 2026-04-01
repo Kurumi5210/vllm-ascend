@@ -1257,6 +1257,7 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                    num_dycp_reqs=scheduler_output.num_cp_request,
                 )
 
                 logger.debug(
@@ -1332,6 +1333,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     total_num_pcp_scheduled_tokens=total_num_pcp_scheduled_tokens,
+                    num_dycp_reqs=scheduler_output.num_cp_request,
                 )
 
             (
@@ -1398,6 +1400,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if not self.use_prefill_cp else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
+                num_cp_reqs=scheduler_output.num_cp_request,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1841,6 +1844,19 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_sparse
         ):
             assert positions is not None
+            num_cp_reqs = getattr(
+                forward_context.batch_descriptor,
+                "num_cp_reqs",
+                getattr(
+                    forward_context.batch_descriptor,
+                    "num_dycp_reqs",
+                    getattr(
+                        forward_context,
+                        "num_cp_reqs",
+                        getattr(forward_context, "num_dycp_reqs", 0),
+                    ),
+                ),
+            )
             update_full_graph_params(
                 self.attn_backend,
                 self.update_stream,
@@ -1849,6 +1865,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 self.speculative_config,
                 positions.shape[0],
+                num_cp_reqs=num_cp_reqs,
             )
 
     def _model_forward(
@@ -1974,6 +1991,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        num_dycp_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
@@ -1997,7 +2015,7 @@ class NPUModelRunner(GPUModelRunner):
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
         # ruff: noqa: E731
-        def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
+        def dispatch_cudagraph(num_tokens, num_dycp_reqs, disable_full=False, valid_modes=None):
             if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
@@ -2008,9 +2026,10 @@ class NPUModelRunner(GPUModelRunner):
                 valid_modes=valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
                 num_active_loras=num_active_loras,
+                num_dycp_reqs=num_dycp_reqs,
             )
 
-        cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, num_dycp_reqs, use_cascade_attn or has_encoder_output)
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -2033,6 +2052,7 @@ class NPUModelRunner(GPUModelRunner):
                 # Re-dispatch with DP padding
                 cudagraph_mode, batch_descriptor = dispatch_cudagraph(
                     num_tokens_padded,
+                    num_dycp_reqs,
                     valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
                 )
                 # Assert to make sure the agreed upon token count is correct otherwise
@@ -2070,6 +2090,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         total_num_pcp_scheduled_tokens: int | None = None,
+        num_dycp_reqs: int = 0,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2175,7 +2196,8 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
-            num_dycp_reqs=num_reqs_padded if getattr(self, 'pcp_manager', None) is None else self.pcp_manager.num_dycp_reqs,
+            # num_dycp_reqs=num_dycp_reqs if num_dycp_reqs else self.pcp_manager.num_dycp_reqs,
+            num_dycp_reqs=num_dycp_reqs,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -2386,6 +2408,7 @@ class NPUModelRunner(GPUModelRunner):
             # LoRA state when determining the batch descriptor for capture
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
+            num_dycp_reqs=num_dycp_reqs,
         )
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -2459,6 +2482,7 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 total_num_pcp_scheduled_tokens=num_tokens_unpadded,
+                num_dycp_reqs=num_dycp_reqs,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -2536,6 +2560,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                num_cp_reqs=num_dycp_reqs,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
