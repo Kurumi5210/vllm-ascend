@@ -411,6 +411,7 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens: torch.Tensor | None = None
         self.cpu_slot_mapping = None
         self.sampling_done_event: torch.npu.Event | None = None
+        self.req_id_to_cp_size = {}
 
     @property
     def use_cp(self) -> bool:
@@ -575,6 +576,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
+        print(f'>>>>>>>> get in prepare input ')
         """
         :return: tuple[
             logits_indices,
@@ -867,14 +869,6 @@ class NPUModelRunner(GPUModelRunner):
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
-        cp_index = num_cp_request
-        domain_count = self.vllm_config.parallel_config.data_parallel_size // self.vllm_config.parallel_config.dp_per_domain
-        for req_id in self.input_batch.req_ids:
-            if cp_index > 0:
-                self.input_batch.req_id_to_cp_size[req_id] = domain_count
-            else:
-                self.input_batch.req_id_to_cp_size[req_id] = 1
-            cp_index-=1
 
         return (
             logits_indices,
@@ -1140,6 +1134,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        logger.info(f'>>>>>>>> scheduler_output: {scheduler_output}')
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1164,6 +1159,13 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                if self.dycp_size > 1:
+                    self.req_id_to_cp_size.update(scheduler_output.req_id_to_cp_size)
+
+                # print(f'>>>>>>> scheduler_output.req_id_to_cp_size: {scheduler_output.req_id_to_cp_size}')
+                # if scheduler_output.req_id_to_cp_size:
+                #     self.input_batch.req_id_to_cp_size.update(scheduler_output.req_id_to_cp_size)
+                # logger.info(f'>>>>>>> self.input_batch.req_id_to_cp_size: {self.input_batch.req_id_to_cp_size}')
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1188,7 +1190,24 @@ class NPUModelRunner(GPUModelRunner):
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
-                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    modelrunneroutput = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    # 先添加到modelrunner的一个全局变量，然后查找connector finish，找到对应的赋值，赋值完成后就可以在全局变量中释放了
+                    # 需要确认P节点和D节点分别在哪里输出 modelrunneroutput.kv_connector_output，找到对应位置赋值
+
+                    # modelrunneroutput.kv_connector_output.req_id_to_cp_size = scheduler_output.req_id_to_cp_size
+                    if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
+                        logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_sending}")
+                        for req_id in modelrunneroutput.kv_connector_output.finished_sending:
+                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                            logger.info(f"chenxiao--debug 0000000000")
+                            # self.req_id_to_cp_size.pop(req_id, None)
+                    if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
+                        logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_recving}")
+                        for req_id in modelrunneroutput.kv_connector_output.finished_recving:
+                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                            logger.info(f"chenxiao--debug 0000000000")
+
+                    return modelrunneroutput
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
@@ -1367,6 +1386,18 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
+                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_sending:{kv_connector_output.finished_sending}")
+                    for req_id in kv_connector_output.finished_sending:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        logger.info(f"chenxiao--debug 222222222222")
+                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_recving:{kv_connector_output.finished_recving}")
+                    for req_id in kv_connector_output.finished_recving:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        
+                        # self.req_id_to_cp_size.pop(req_id, None)
+
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -1390,10 +1421,29 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output, clear_metadata=clear_kv_metadata
                 ) as kv_connector_output,
             ):
+                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_sending:{kv_connector_output.finished_sending}")
+                    for req_id in kv_connector_output.finished_sending:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        logger.info(f"chenxiao--debug 3333333333333333")
+                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_recving:{kv_connector_output.finished_recving}")
+                    for req_id in kv_connector_output.finished_recving:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        logger.info(f"chenxiao--debug 3333333333333333")
+                        # self.req_id_to_cp_size.pop(req_id, None)
+
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
         with record_function_or_nullcontext("post process"):
+            if kv_connector_output.finished_sending:
+                for req_id in kv_connector_output.finished_sending:
+                    kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+            
+            if kv_connector_output.finished_recving:
+                for req_id in kv_connector_output.finished_recving:
+                    kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -1582,6 +1632,8 @@ class NPUModelRunner(GPUModelRunner):
                 capturer.save_captured_experts(indices=self.cpu_slot_mapping)
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
+
+        print(f'>>>>>> sample self.input_batch.req_id_to_cp_size:{self.input_batch.req_id_to_cp_size}')
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,

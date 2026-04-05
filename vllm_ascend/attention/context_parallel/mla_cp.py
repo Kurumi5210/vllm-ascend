@@ -2,6 +2,7 @@ from typing import ClassVar, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+from vllm.logger import logger
 import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -60,7 +61,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     CPChunkedContextMetadata,
     _npu_attention_update,
     _process_attn_out_lse,
-    _npu_update_dycp_attn_with_mask,
+    _npu_update_dycp_attn,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params, update_graph_params_workspaces
@@ -284,11 +285,17 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         # [bs, pcp_size, dcp_size]
         num_computed_tokens_of_cp_dcp_array = np.array(num_computed_tokens_of_pcp_dcp)[: self.num_decodes_flatten]
 
-        cp_seq_len = num_computed_tokens_of_cp_dcp_array[:, self.pcp_rank, self.dcp_rank]
-        cp_seq_len = torch.tensor(cp_seq_len, dtype=torch.int32)
-        decode_metadata.cp_seq_len = cp_seq_len.tolist()
+        # cp_seq_len = num_computed_tokens_of_cp_dcp_array[:, self.pcp_rank, self.dcp_rank]
+        # cp_seq_len = torch.tensor(cp_seq_len, dtype=torch.int32)
+        # decode_metadata.cp_seq_len = cp_seq_len.tolist()
+        cp_seq_len = get_dcp_local_seq_lens(decode_metadata.seq_lens,
+                                            self.dycp_size,
+                                            self.dycp_rank,
+                                            self.cp_local_block_size
+                                            )
+        logger.info(f"======= decode_metadata.seq_lens: {decode_metadata.seq_lens}, cp_seq_len: {cp_seq_len}, common_attn_metadata.num_dycp_reqs: {common_attn_metadata.num_dycp_reqs}")
         if common_attn_metadata.num_dycp_reqs:
-            decode_metadata.seq_len[:common_attn_metadata.num_dycp_reqs] = decode_metadata.cp_seq_len[:common_attn_metadata.num_dycp_reqs]
+            decode_metadata.seq_lens[:common_attn_metadata.num_dycp_reqs] = cp_seq_len[:common_attn_metadata.num_dycp_reqs]
 
         actual_seq_lengths_q = torch.arange(self.num_decodes_flatten) + 1
         decode_metadata.actual_seq_lengths_q = actual_seq_lengths_q
@@ -406,7 +413,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 # if num_dycp_reqs > 0:
                 # seq_len = decode_meta.seq_lens
                 # else:
-                seq_len = decode_meta.cp_seq_len
+                seq_len = forward_context.attn_metadata[key].seq_lens
                 if isinstance(seq_len, torch.Tensor):
                     seq_len = seq_len.tolist()
                 actual_seq_lengths_kv = seq_len
@@ -807,7 +814,8 @@ class AscendMlaCPImpl(AscendMLAImpl):
         num_dycp_reqs = attn_metadata.num_dycp_reqs
         assert decode_meta is not None
 
-        seq_lens = decode_meta.cp_seq_len
+        seq_lens = decode_meta.seq_lens
+        # logger.info(f"chenxiao--debug seq_lens:{seq_lens}")
         num_tokens = q_nope.size(0)
         # shape of knope/k_pe for npu graph mode should be:
         # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
@@ -860,7 +868,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             "actual_seq_lengths_kv": seq_lens,
             "softmax_lse_flag": True,
         }
-
+        # logger.info(f"chenxiao--debug self.num_kv_heads:{self.num_kv_heads}; block_size:{block_size}; decode_meta.block_table:{decode_meta.block_table}; seq_lens:{seq_lens}")
         forward_context: ForwardContext = get_forward_context()
         if forward_context.is_draft_model:
             graph_params = get_draft_graph_params()
@@ -1217,5 +1225,5 @@ def split_prefill_metadata(
         cos=dp_cos,
         pcp_metadata=None,  # DP 不需要
     )
-    
+
     return dycp_prefill, dp_prefill
