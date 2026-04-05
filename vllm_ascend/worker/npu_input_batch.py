@@ -212,3 +212,10 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    # def remove_request(self, req_id: str) -> int | None:
+    #     req_index = super().remove_request(req_id)
+    #     print(f'>>>>>>>>req_id: {req_id}, self.req_id_to_cp_size: {self.req_id_to_cp_size}')
+    #     self.req_id_to_cp_size.pop(req_id, None)
+    #     return req_index
+

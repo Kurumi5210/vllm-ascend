@@ -98,6 +98,7 @@ class ACLGraphWrapper:
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
+        # logger.info(f"chenxiao--debug batch_descriptor:{batch_descriptor}")
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:

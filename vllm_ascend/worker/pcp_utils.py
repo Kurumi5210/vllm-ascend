@@ -771,7 +771,7 @@ class PCPManager:
             prefill_context_lens = input_batch.num_computed_tokens_cpu[self.num_decode_reqs : self.num_dycp_reqs]
             context_lens = np.concatenate([decode_context_lens, prefill_context_lens])
             num_computed_tokens_of_pcp_dcp = torch.zeros(
-                [self.num_dycp_reqs * self.decode_threshold, self.pcp_world_size, self.dcp_world_size],
+                [self.num_dycp_reqs * self.decode_threshold, self.pcp_world_size, self.dcp_world_size*self.dycp_world_size],
                 dtype=torch.int32,
             )
             # For pcp + spec decode, we flatten seq_lens
@@ -784,19 +784,19 @@ class PCPManager:
                         self._get_cp_local_seq_lens(
                             torch.tensor(context_lens) - decode_idx,
                             self.pcp_world_size,
-                            self.dcp_world_size,
+                            self.dycp_world_size,
                             self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
                         )
                     )[:self.num_dycp_reqs]
-                else:
-                    num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
-                        self._get_cp_local_seq_lens(
-                            torch.tensor(context_lens) - decode_idx,
-                            self.pcp_world_size,
-                            self.dcp_world_size,
-                            self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
-                        )
-                    )
+                # else:
+                #     num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
+                #         self._get_cp_local_seq_lens(
+                #             torch.tensor(context_lens) - decode_idx,
+                #             self.pcp_world_size,
+                #             self.dcp_world_size,
+                #             self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                #         )
+                #     )
             if self.decode_threshold > 1:
                 num_computed_tokens_of_pcp_dcp_list = []
                 if self.num_decode_reqs:
