@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -532,6 +533,12 @@ class PCPManager:
         # ignores the padding from CUDA Graph.
         from vllm.distributed.parallel_state import get_pcp_group, get_dycp_group
 
+        logger.info(
+            f"chenxiao--debug restore_hidden_states input_shape={tuple(hidden_states.shape)}, "
+            f"num_actual_tokens_pcp_padded={self.num_actual_tokens_pcp_padded}, "
+            f"num_dycp_reqs={self.num_dycp_reqs}, dycp_world_size={self.dycp_world_size}, "
+            f"pcp_world_size={self.pcp_world_size}, pcp_use_hybrid_attn={self.pcp_use_hybrid_attn}"
+        )
         if not self.pcp_use_hybrid_attn:
             dp_hidden_states = hidden_states[self.num_actual_tokens_pcp_padded // self.pcp_world_size :]
             if self.num_dycp_reqs > 0:
@@ -547,6 +554,11 @@ class PCPManager:
                     cp_hidden_states, 0, self.pcp_allgather_restore_idx.gpu[:cp_hidden_states.shape[0]])
                 dp_hidden_states = torch.cat([cp_hidden_states, dp_hidden_states])
             hidden_states = dp_hidden_states
+            logger.info(
+                f"chenxiao--debug restore_hidden_states output_shape={tuple(hidden_states.shape)}, "
+                f"cp_hidden_tokens={self.num_actual_tokens_pcp_padded}, "
+                f"dp_hidden_tokens={hidden_states.shape[0] - self.num_actual_tokens_pcp_padded}"
+            )
             return hidden_states
         else:
             if self.pcp_padded_tokens_fla > 0:
@@ -555,7 +567,12 @@ class PCPManager:
                 )
             hidden_states = get_pcp_group().all_gather(hidden_states.contiguous(), dim=0)
             restore_idx = self.pcp_enter_fa_restore_idx[: hidden_states.shape[0] - self.total_pcp_padding_tokens_fla]
-            return torch.index_select(hidden_states, 0, restore_idx)
+            hidden_states = torch.index_select(hidden_states, 0, restore_idx)
+            logger.info(
+                f"chenxiao--debug restore_hidden_states hybrid_output_shape={tuple(hidden_states.shape)}, "
+                f"total_pcp_padding_tokens_fla={self.total_pcp_padding_tokens_fla}"
+            )
+            return hidden_states
 
     def generate_pcp_mtp_input(
         self,
@@ -771,7 +788,7 @@ class PCPManager:
             prefill_context_lens = input_batch.num_computed_tokens_cpu[self.num_decode_reqs : self.num_dycp_reqs]
             context_lens = np.concatenate([decode_context_lens, prefill_context_lens])
             num_computed_tokens_of_pcp_dcp = torch.zeros(
-                [self.num_dycp_reqs * self.decode_threshold, self.pcp_world_size, self.dcp_world_size],
+                [self.num_dycp_reqs * self.decode_threshold, self.pcp_world_size, self.dcp_world_size*self.dycp_world_size],
                 dtype=torch.int32,
             )
             # For pcp + spec decode, we flatten seq_lens
@@ -779,14 +796,24 @@ class PCPManager:
             # Same as block_table, we flatten decode seq_lens to query_lens,
             # and keep prefill seq_lens unchanged.
             for decode_idx in range(self.decode_threshold):
-                num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
-                    self._get_cp_local_seq_lens(
-                        torch.tensor(context_lens) - decode_idx,
-                        self.pcp_world_size,
-                        self.dcp_world_size,
-                        self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
-                    )
-                )
+                if self.num_dycp_reqs > 0:
+                    num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
+                        self._get_cp_local_seq_lens(
+                            torch.tensor(context_lens) - decode_idx,
+                            self.pcp_world_size,
+                            self.dycp_world_size,
+                            self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                        )
+                    )[:self.num_dycp_reqs]
+                # else:
+                #     num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
+                #         self._get_cp_local_seq_lens(
+                #             torch.tensor(context_lens) - decode_idx,
+                #             self.pcp_world_size,
+                #             self.dcp_world_size,
+                #             self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                #         )
+                #     )
             if self.decode_threshold > 1:
                 num_computed_tokens_of_pcp_dcp_list = []
                 if self.num_decode_reqs:

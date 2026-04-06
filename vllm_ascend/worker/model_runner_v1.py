@@ -411,6 +411,7 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens: torch.Tensor | None = None
         self.cpu_slot_mapping = None
         self.sampling_done_event: torch.npu.Event | None = None
+        self.req_id_to_cp_size = {}
 
     @property
     def use_cp(self) -> bool:
@@ -575,6 +576,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
+        # print(f'>>>>>>>> get in prepare input ')
         """
         :return: tuple[
             logits_indices,
@@ -758,6 +760,11 @@ class NPUModelRunner(GPUModelRunner):
             self.gdn_query_start_loc.copy_to_gpu()
 
         self.seq_lens.np[:num_reqs] = self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        # Keep CPU seq_lens tail clean because metadata builders consume
+        # seq_lens_cpu[:num_reqs_padded] in full-graph mode.
+        # If tail is stale, padded requests may inherit old lengths and
+        # produce incorrect attention inputs during graph replay.
+        self.seq_lens.np[num_reqs:] = 0
         self.seq_lens.copy_to_gpu()
 
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
@@ -819,7 +826,43 @@ class NPUModelRunner(GPUModelRunner):
             num_draft_tokens = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
             if self.use_cp:
-                logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
+                base_logits_indices = torch.from_numpy(cu_num_tokens[:num_reqs].copy()) - 1
+                if self.use_prefill_cp:
+                    logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
+                    logger.info(
+                        f"chenxiao--debug logits_indices prefill_cp num_reqs={num_reqs}, "
+                        f"num_cp_request={num_cp_request}, cu_num_tokens={cu_num_tokens[:num_reqs].tolist()}, "
+                        f"logits_indices={logits_indices.tolist()}"
+                    )
+                elif self.dycp_size > 1 and num_cp_request > 0:
+                    num_dycp_reqs = num_cp_request
+                    num_dycp_tokens = int(num_scheduled_tokens[:num_dycp_reqs].sum())
+                    logits_indices = base_logits_indices.clone()
+                    logits_indices[:num_dycp_reqs] = self.pcp_manager.get_logits_indices(
+                        cu_num_tokens[:num_dycp_reqs],
+                        num_dycp_reqs,
+                    )
+                    dycp_allgathered_size = num_dycp_tokens
+                    if num_dycp_reqs < num_reqs:
+                        # NOTE: restored hidden_states still include padded DYCP
+                        # slots, so the DP part should be shifted by gathered
+                        # (padded) DYCP size rather than unpadded size.
+                        dycp_allgathered_size = int(cu_num_tokens[num_dycp_reqs - 1]) * self.dycp_size
+                        logits_indices[num_dycp_reqs:] += (dycp_allgathered_size - num_dycp_tokens)
+                    logger.info(
+                        f"chenxiao--debug logits_indices dycp num_reqs={num_reqs}, "
+                        f"num_dycp_reqs={num_dycp_reqs}, num_dycp_tokens={num_dycp_tokens}, "
+                        f"dycp_allgathered_size={dycp_allgathered_size}, "
+                        f"cu_num_tokens={cu_num_tokens[:num_reqs].tolist()}, logits_indices={logits_indices.tolist()}"
+                    )
+                else:
+                    logits_indices = base_logits_indices
+                    logger.info(
+                        f"chenxiao--debug logits_indices cp_base num_reqs={num_reqs}, "
+                        f"num_cp_request={num_cp_request}, dycp_size={self.dycp_size}, "
+                        f"dcp_size={self.dcp_size}, cu_num_tokens={cu_num_tokens[:num_reqs].tolist()}, "
+                        f"logits_indices={logits_indices.tolist()}"
+                    )
                 logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=True)
             else:
                 logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
@@ -867,14 +910,6 @@ class NPUModelRunner(GPUModelRunner):
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
-        cp_index = num_cp_request
-        domain_count = self.vllm_config.parallel_config.data_parallel_size // self.vllm_config.parallel_config.dp_per_domain
-        for req_id in self.input_batch.req_ids:
-            if cp_index > 0:
-                self.input_batch.req_id_to_cp_size[req_id] = domain_count
-            else:
-                self.input_batch.req_id_to_cp_size[req_id] = 1
-            cp_index-=1
 
         return (
             logits_indices,
@@ -1140,6 +1175,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # logger.info(f'>>>>>>>> scheduler_output: {scheduler_output}')
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1164,6 +1200,13 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                if self.dycp_size > 1:
+                    self.req_id_to_cp_size.update(scheduler_output.req_id_to_cp_size)
+
+                # print(f'>>>>>>> scheduler_output.req_id_to_cp_size: {scheduler_output.req_id_to_cp_size}')
+                # if scheduler_output.req_id_to_cp_size:
+                #     self.input_batch.req_id_to_cp_size.update(scheduler_output.req_id_to_cp_size)
+                # logger.info(f'>>>>>>> self.input_batch.req_id_to_cp_size: {self.input_batch.req_id_to_cp_size}')
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1188,7 +1231,24 @@ class NPUModelRunner(GPUModelRunner):
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
-                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    modelrunneroutput = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    # 先添加到modelrunner的一个全局变量，然后查找connector finish，找到对应的赋值，赋值完成后就可以在全局变量中释放了
+                    # 需要确认P节点和D节点分别在哪里输出 modelrunneroutput.kv_connector_output，找到对应位置赋值
+
+                    # modelrunneroutput.kv_connector_output.req_id_to_cp_size = scheduler_output.req_id_to_cp_size
+                    if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
+                        # logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_sending}")
+                        for req_id in modelrunneroutput.kv_connector_output.finished_sending:
+                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                            # logger.info(f"chenxiao--debug 0000000000")
+                            # self.req_id_to_cp_size.pop(req_id, None)
+                    if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
+                        # logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_recving}")
+                        for req_id in modelrunneroutput.kv_connector_output.finished_recving:
+                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                            # logger.info(f"chenxiao--debug 0000000000")
+
+                    return modelrunneroutput
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
@@ -1367,6 +1427,18 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
+                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_sending:{kv_connector_output.finished_sending}")
+                    for req_id in kv_connector_output.finished_sending:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        logger.info(f"chenxiao--debug 222222222222")
+                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_recving:{kv_connector_output.finished_recving}")
+                    for req_id in kv_connector_output.finished_recving:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        
+                        # self.req_id_to_cp_size.pop(req_id, None)
+
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -1390,10 +1462,29 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output, clear_metadata=clear_kv_metadata
                 ) as kv_connector_output,
             ):
+                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_sending:{kv_connector_output.finished_sending}")
+                    for req_id in kv_connector_output.finished_sending:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        logger.info(f"chenxiao--debug 3333333333333333")
+                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                    logger.info(f"chenxiao--debug kv_connector_output.finished_recving:{kv_connector_output.finished_recving}")
+                    for req_id in kv_connector_output.finished_recving:
+                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        logger.info(f"chenxiao--debug 3333333333333333")
+                        # self.req_id_to_cp_size.pop(req_id, None)
+
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
         with record_function_or_nullcontext("post process"):
+            if kv_connector_output.finished_sending:
+                for req_id in kv_connector_output.finished_sending:
+                    kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+            
+            if kv_connector_output.finished_recving:
+                for req_id in kv_connector_output.finished_recving:
+                    kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -1406,6 +1497,12 @@ class NPUModelRunner(GPUModelRunner):
                         self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
+            if self.use_cp and self.dycp_size > 1:
+                preview_logits_indices = logits_indices[:num_reqs].detach().cpu().tolist()
+                logger.info(
+                    f"chenxiao--debug sample_prepare hidden_states_shape={tuple(hidden_states.shape)}, "
+                    f"num_reqs={num_reqs}, preview_logits_indices={preview_logits_indices}"
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -1429,6 +1526,11 @@ class NPUModelRunner(GPUModelRunner):
                         self.debugger.step()
                     return output
 
+                if self.use_cp and self.dycp_size > 1:
+                    logger.info(
+                        f"chenxiao--debug compute_logits logits_indices={logits_indices[:num_reqs].detach().cpu().tolist()}, "
+                        f"hidden_states_shape={tuple(hidden_states.shape)}"
+                    )
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
@@ -1436,10 +1538,20 @@ class NPUModelRunner(GPUModelRunner):
                 assert not self.is_pooling_model
 
                 if not get_pp_group().is_last_rank:
+                    if self.use_cp and self.dycp_size > 1:
+                        logger.info(
+                            f"chenxiao--debug compute_logits_pp logits_indices={logits_indices[:num_reqs].detach().cpu().tolist()}, "
+                            f"hidden_states_shape={tuple(hidden_states.shape)}"
+                        )
                     sample_hidden_states = hidden_states[logits_indices]
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
+                    if self.use_cp and self.dycp_size > 1:
+                        logger.info(
+                            f"chenxiao--debug compute_logits_pp_last logits_indices={logits_indices[:num_reqs].detach().cpu().tolist()}, "
+                            f"hidden_states_shape={tuple(hidden_states.shape)}"
+                        )
                     sample_hidden_states = hidden_states[logits_indices]
                     logits = self.model.compute_logits(sample_hidden_states)
 
@@ -1582,6 +1694,8 @@ class NPUModelRunner(GPUModelRunner):
                 capturer.save_captured_experts(indices=self.cpu_slot_mapping)
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
+
+        # print(f'>>>>>> sample self.input_batch.req_id_to_cp_size:{self.input_batch.req_id_to_cp_size}')
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -1819,19 +1933,11 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_sparse
         ):
             assert positions is not None
-            num_cp_reqs = getattr(
-                forward_context.batch_descriptor,
-                "num_cp_reqs",
-                getattr(
-                    forward_context.batch_descriptor,
-                    "num_dycp_reqs",
-                    getattr(
-                        forward_context,
-                        "num_cp_reqs",
-                        getattr(forward_context, "num_dycp_reqs", 0),
-                    ),
-                ),
-            )
+            # Use runtime forward context as the source of truth.
+            # batch_descriptor may be reused by dispatcher and can diverge from
+            # current step cp-request count in some decode paths. Keep the
+            # explicit runtime value (including 0) to avoid graph-key mismatch.
+            num_cp_reqs = getattr(forward_context, "num_cp_reqs", getattr(forward_context, "num_dycp_reqs", 0))
             update_full_graph_params(
                 self.attn_backend,
                 self.update_stream,
@@ -2124,7 +2230,6 @@ class NPUModelRunner(GPUModelRunner):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
-
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],

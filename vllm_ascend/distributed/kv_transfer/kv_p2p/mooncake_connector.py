@@ -251,7 +251,7 @@ class KVCacheSendingThread(threading.Thread):
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(self.metadata)
         size_in_bytes = len(encoded_data)
-        logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
+        logger.info("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
         while True:
@@ -271,7 +271,7 @@ class KVCacheSendingThread(threading.Thread):
                 if msg[0] == GET_META_MSG:
                     sock.send_multipart((identity, b"", encoded_data))
                 elif msg[0] == DONE_RECVING_MSG:
-                    logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
+                    logger.info("Got DONE_RECVING_MSG for request %s", msg[1])
                     request_id = msg[1]
                     remote_port_send_num = msg[2]
                     if remote_port_send_num:
@@ -293,7 +293,7 @@ class KVCacheSendingThread(threading.Thread):
                             break
                         except zmq.Again:  # type: ignore
                             # If the socket is not ready, retry sending.
-                            logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
+                            logger.info("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
                 else:
                     logger.error("Connection listener got unexpected message %s", msg)
@@ -388,7 +388,7 @@ class KVCacheRecvingThread(threading.Thread):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
             remote_port_send_num = {}
-        logger.debug(f"Adding request {request_id} to the queue.")
+        logger.info(f"Adding request {request_id} to the queue.")
         self.request_queue.put(
             {
                 "request_id": request_id,
@@ -413,8 +413,8 @@ class KVCacheRecvingThread(threading.Thread):
         """
         return self.task_tracker.get_and_clear_finished_requests()
 
-    def add_not_transfer_request(self, request_id: str):
-        self.task_tracker.add_not_transfer_request(request_id)
+    # def add_not_transfer_request(self, request_id: str):
+    #     self.task_tracker.add_not_transfer_request(request_id)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -439,9 +439,9 @@ class KVCacheRecvingThread(threading.Thread):
         all_task_done = req_meta["all_task_done"]
 
         try:
-            logger.debug(f"Starting to transfer KV cache for request {remote_request_id}.")
+            logger.info(f"Starting to transfer KV cache for request {remote_request_id}.")
             self._transfer_kv_cache(req_meta)
-            logger.debug(f"Finished transferring KV cache for request {remote_request_id}.")
+            logger.info(f"Finished transferring KV cache for request {remote_request_id}.")
         except Exception as e:
             logger.error(f"Failed to transfer KV cache for request {remote_request_id}: {e}", exc_info=True)
         finally:
@@ -526,7 +526,7 @@ class KVCacheRecvingThread(threading.Thread):
         local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port][
             first_layer_index * num_cache_per_layer : end_layer_index * num_cache_per_layer
         ]
-        logger.debug(f"transfer kv cache first_layer_index:{first_layer_index} , end_layer_index:{end_layer_index}")
+        logger.info(f"transfer kv cache first_layer_index:{first_layer_index} , end_layer_index:{end_layer_index}")
         remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
         num_blocks = len(local_block_ids)
         session_id = f"{remote_host}:{remote_transfer_port}"
@@ -714,7 +714,7 @@ class KVCacheRecvingThread(threading.Thread):
         finally:
             if sock is not None:
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
-                logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
+                logger.info("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
 
     def _send_done_recv_signal(
         self,
@@ -723,7 +723,7 @@ class KVCacheRecvingThread(threading.Thread):
         remote_handshake_port: int,
         remote_port_send_num: dict[int, RemotePortInfo],
     ):
-        logger.debug(
+        logger.info(
             "Sending done recving signal for request %s to %s:%d", request_id, remote_host, remote_handshake_port
         )
         sock: zmq.Socket | None = None  # type: ignore
@@ -734,7 +734,7 @@ class KVCacheRecvingThread(threading.Thread):
             resp = ensure_zmq_recv(
                 sock, self.remote_poller, f"{remote_host}:{remote_handshake_port}", timeout=self.timeout
             )
-            logger.debug(f"Received response for request {request_id}: {resp.decode('utf-8')}")
+            logger.info(f"Received response for request {request_id}: {resp.decode('utf-8')}")
             if resp != b"ACK":
                 logger.error(
                     "Failed to receive ACK for request %s from %s:%d", request_id, remote_host, remote_handshake_port
@@ -748,7 +748,7 @@ class KVCacheRecvingThread(threading.Thread):
         finally:
             if sock is not None:
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
-                logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
+                logger.info("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
@@ -977,7 +977,7 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
+        logger.info(
             "MooncakeConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
             num_computed_tokens,
             params,
@@ -995,7 +995,7 @@ class MooncakeConnectorScheduler:
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         params = request.kv_transfer_params
-        logger.debug(
+        logger.info(
             "MooncakeConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
             num_external_tokens,
             params,
@@ -1062,8 +1062,8 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
+        logger.info(
+            "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s, request.cp_ranks=%s", request.status, params, request.cp_ranks
         )
 
         if (
@@ -1076,7 +1076,7 @@ class MooncakeConnectorScheduler:
         computed_block_ids = block_ids
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
-            logger.info("Delaying free of %d blocks for request %s", len(computed_block_ids), request.request_id)
+            logger.info(f"Delaying free of {computed_block_ids}, blocks for request {request.request_id}")
             self._reqs_need_send[request.request_id] = time.time()
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
@@ -1324,7 +1324,7 @@ class MooncakeConnectorWorker:
             else set()
         )
         if self.tp_rank == 0:
-            logger.debug(
+            logger.info(
                 "Number of completed KV cache send requests: %d, receive requests: %d",
                 len(done_sending),
                 len(done_recving),
@@ -1345,7 +1345,7 @@ class MooncakeConnectorWorker:
         decode_dycp_enable = True if meta.local_dycp_ranks else False
         if decode_dycp_enable and self.dp_rank not in meta.local_dycp_ranks:
             self.remote_port_send_num[meta.remote_engine_id] = None
-            self.kv_recv_thread.add_not_transfer_request(req_id)
+            # self.kv_recv_thread.add_not_transfer_request(req_id)
             return [], [], []
         remote_dycp_ranks = meta.remote_dycp_ranks if prefill_dycp_enable else list(range(meta.remote_pcp_size))
         local_dycp_ranks = meta.local_dycp_ranks if decode_dycp_enable else [0]
@@ -1357,7 +1357,7 @@ class MooncakeConnectorWorker:
         local_cp_size = local_pcp_size * self.dcp_size  # decode pcp is not supported now
         local_block_ids = meta.local_block_ids[self.dp_rank] if decode_dycp_enable else meta.local_block_ids
 
-        if meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size == 1 and not prefill_dycp_enable:
+        if meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size == 1 and not prefill_dycp_enable and not decode_dycp_enable:
             chosen_rank_list = self._get_remote_rank(req_id, prefill_tp_size)
             remote_handshake_port_list = [[x + meta.remote_port for x in chosen_rank_list]]
             local_block_ids_list, remote_block_ids_list = [meta.local_block_ids], [meta.remote_block_ids]
@@ -1495,6 +1495,7 @@ class MooncakeConnectorWorker:
         self.remote_port_send_num[meta.remote_engine_id] = get_remote_port_send_num(
             local_remote_block_port_mappings
         )
+        print(f'>>>>>>> self.remote_port_send_num: {self.remote_port_send_num}')
 
         local_remote_block_port_mapping = copy.deepcopy(self.local_remote_block_port_mapping[meta.remote_engine_id])
 
@@ -1567,17 +1568,19 @@ class MooncakeConnectorWorker:
                     remote_block_nums.append(block_num)
 
             assert local_remote_block_port_mapping is not None
+            logger.info(f"chenxiao--debug remote_block_nums:{remote_block_nums}, final_block_idx:{final_block_idx}")
             if final_block_idx is not None:
                 final_block_num = remote_block_nums.pop(final_block_idx)
                 remote_block_nums.append(final_block_num)
-                if prefill_dycp_enable:
-                    remote_block_ids = meta.remote_block_ids.pop(final_block_idx)
-                    meta.remote_block_ids.append(remote_block_ids)
+                # if prefill_dycp_enable:
+                #     remote_block_ids = meta_remote_block_ids.pop(final_block_idx) if prefill_dycp_enable else meta_remote_block_ids
+                #     meta_remote_block_ids.append(remote_block_ids)
                 for mapping in local_remote_block_port_mapping:
                     final_block_port = mapping.pop(final_block_idx)
                     mapping.append(final_block_port)
 
             remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = [], [], []
+            logger.info(f"chenxiao--debug local_remote_block_port_mapping:{local_remote_block_port_mapping}")
             for idx in range(len(local_remote_block_port_mapping[0])):
                 mapping_list = []
                 for mapping in local_remote_block_port_mapping:
@@ -1589,9 +1592,12 @@ class MooncakeConnectorWorker:
             # remote_handshake_port_list[[30000],[30001],[30004],[30005]]
             # D rank will get remote block 1 in port 30004 and save it in local block 5
             local_block_offset = 0
+            # logger.info(f"chenxiao--debug remote_handshake_port_list:{remote_handshake_port_list}, meta.remote_block_ids:{meta_remote_block_ids}, remote_block_nums:{remote_block_nums}")
+
             for remote_kv_id in range(len(remote_handshake_port_list)):
                 num_blocks_to_pull = remote_block_nums[remote_kv_id]
                 remote_block_ids = meta.remote_block_ids[remote_kv_id] if prefill_dycp_enable else meta.remote_block_ids
+                logger.info(f"chenxiao--debug num_blocks_to_pull:{num_blocks_to_pull}, len(remote_block_ids):{len(remote_block_ids)}")
                 assert num_blocks_to_pull <= len(remote_block_ids)
                 remote_block_ids_list.append(remote_block_ids[:num_blocks_to_pull])   # [[1,2],[4,5]]
                 local_block_ids_list.append(
@@ -1609,7 +1615,8 @@ class MooncakeConnectorWorker:
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         for req_id, meta in metadata.requests.items():
-            logger.debug(
+            logger.info(f"chenxiao--debug meta.remote_block_ids:{meta.remote_block_ids}, req_id: {req_id}, meta.remote_dycp_ranks: {meta.remote_dycp_ranks}, meta.local_block_ids: {meta.local_block_ids}")
+            logger.info(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ",
                 req_id,
@@ -1622,11 +1629,12 @@ class MooncakeConnectorWorker:
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
             remote_req_id = meta.remote_request_id
 
-            if len(meta.remote_dycp_ranks) > 0 or meta.remote_pcp_size * meta.remote_dcp_size > 1:
+            if len(meta.remote_dycp_ranks) > 0 or meta.remote_pcp_size * meta.remote_dcp_size or self.dp_per_domain > 1:
                 rank_id = torch.distributed.get_rank()
                 remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = self._get_kv_split_metadata(
                     req_id, meta
                 )
+                print(f'>>>>>>> remote_handshake_port_list: {remote_handshake_port_list}, local_block_ids_list: {local_block_ids_list}, remote_block_ids_list: {remote_block_ids_list}')
 
                 for pcp_dcp_rank in range(len(remote_handshake_port_list)):
                     for i in range(tp_num_need_pulls):
