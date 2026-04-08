@@ -989,6 +989,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         chunked_context: CPChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
+        num_dycp_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return kv_c_normed, k_pe
 
@@ -1510,7 +1511,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 if is_hidden_layer(layer):
                     reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
-
+        logger.info(f"chenxiaod--debug attn_metadata.num_decodes:{attn_metadata.num_decodes}")
         forward_context = get_forward_context()
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
         assert (
