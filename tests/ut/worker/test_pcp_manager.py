@@ -17,7 +17,52 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.pcp_utils import PCPManager, build_batch_req_id_to_cp_size
+
+
+@pytest.mark.parametrize(
+    ("scheduler_req_cp_size", "cached_req_cp_size", "expected_cp_size"),
+    [
+        ({"dycp_req": 8}, {}, 8),
+        ({}, {"dycp_req": 4}, 4),
+        ({}, {"dycp_req": 1}, 8),
+        ({}, {}, 8),
+    ],
+)
+def test_build_batch_req_id_to_cp_size_uses_dynamic_cp_prefix(
+    scheduler_req_cp_size,
+    cached_req_cp_size,
+    expected_cp_size,
+):
+    req_id_to_cp_size = build_batch_req_id_to_cp_size(
+        ["dycp_req", "short_req"],
+        scheduler_req_cp_size,
+        cached_req_cp_size,
+        num_cp_request=1,
+        fallback_cp_size=8,
+    )
+
+    assert req_id_to_cp_size == {
+        "dycp_req": expected_cp_size,
+        "short_req": 1,
+    }
+
+
+def test_get_logits_indices_uses_pcp_world_size_for_dp_tail():
+    pcp_manager = object.__new__(PCPManager)
+    pcp_manager.pcp_use_hybrid_attn = False
+    pcp_manager.pcp_world_size = 4
+    pcp_manager.num_dycp_reqs = 1
+    pcp_manager.num_reqs = 3
+    pcp_manager.num_pcp_pads_cpu_tensor = torch.zeros(3, dtype=torch.int64)
+
+    logits_indices = PCPManager.get_logits_indices(
+        pcp_manager,
+        np.array([2, 3, 5], dtype=np.int32),
+        num_reqs=3,
+    )
+
+    assert logits_indices.tolist() == [7, 8, 10]
 
 
 @pytest.mark.parametrize(

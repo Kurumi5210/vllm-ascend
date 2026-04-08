@@ -124,7 +124,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
-from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.pcp_utils import PCPManager, build_batch_req_id_to_cp_size
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -420,6 +420,36 @@ class NPUModelRunner(GPUModelRunner):
     @property
     def use_prefill_cp(self) -> bool:
         return self.pcp_size > 1 or self.prefill_dycp_size > 1
+
+    def _get_fallback_cp_size(self) -> int:
+        parallel_config = self.vllm_config.parallel_config
+        dp_per_domain = max(1, parallel_config.dp_per_domain)
+        return max(1, parallel_config.data_parallel_size // dp_per_domain)
+
+    def _get_req_cp_size(self, req_id: str) -> int:
+        return self.req_id_to_cp_size.get(
+            req_id,
+            self.input_batch.req_id_to_cp_size.get(req_id, 1),
+        )
+
+    def _update_batch_req_cp_sizes(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cp_request: int,
+    ) -> None:
+        scheduler_req_cp_size = getattr(scheduler_output, "req_id_to_cp_size", {}) or {}
+        if scheduler_req_cp_size:
+            self.req_id_to_cp_size.update(scheduler_req_cp_size)
+
+        req_id_to_cp_size = build_batch_req_id_to_cp_size(
+            self.input_batch.req_ids,
+            scheduler_req_cp_size,
+            self.req_id_to_cp_size,
+            num_cp_request,
+            self._get_fallback_cp_size(),
+        )
+        self.req_id_to_cp_size.update(req_id_to_cp_size)
+        self.input_batch.req_id_to_cp_size = req_id_to_cp_size
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -836,23 +866,10 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 elif self.dycp_size > 1 and num_cp_request > 0:
                     num_dycp_reqs = num_cp_request
-                    num_dycp_tokens = int(num_scheduled_tokens[:num_dycp_reqs].sum())
-                    logits_indices = base_logits_indices.clone()
-                    logits_indices[:num_dycp_reqs] = self.pcp_manager.get_logits_indices(
-                        cu_num_tokens[:num_dycp_reqs],
-                        num_dycp_reqs,
-                    )
-                    dycp_allgathered_size = num_dycp_tokens
-                    if num_dycp_reqs < num_reqs:
-                        # NOTE: restored hidden_states still include padded DYCP
-                        # slots, so the DP part should be shifted by gathered
-                        # (padded) DYCP size rather than unpadded size.
-                        dycp_allgathered_size = int(cu_num_tokens[num_dycp_reqs - 1]) * self.dycp_size
-                        logits_indices[num_dycp_reqs:] += (dycp_allgathered_size - num_dycp_tokens)
+                    logits_indices = base_logits_indices
                     logger.info(
                         f"chenxiao--debug logits_indices dycp num_reqs={num_reqs}, "
-                        f"num_dycp_reqs={num_dycp_reqs}, num_dycp_tokens={num_dycp_tokens}, "
-                        f"dycp_allgathered_size={dycp_allgathered_size}, "
+                        f"num_dycp_reqs={num_dycp_reqs}, "
                         f"cu_num_tokens={cu_num_tokens[:num_reqs].tolist()}, logits_indices={logits_indices.tolist()}"
                     )
                 else:
@@ -910,6 +927,8 @@ class NPUModelRunner(GPUModelRunner):
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
+
+        self._update_batch_req_cp_sizes(scheduler_output, num_cp_request)
 
         return (
             logits_indices,
@@ -1201,7 +1220,9 @@ class NPUModelRunner(GPUModelRunner):
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
                 if self.dycp_size > 1:
-                    self.req_id_to_cp_size.update(scheduler_output.req_id_to_cp_size)
+                    self.req_id_to_cp_size.update(
+                        getattr(scheduler_output, "req_id_to_cp_size", {}) or {}
+                    )
 
                 # print(f'>>>>>>> scheduler_output.req_id_to_cp_size: {scheduler_output.req_id_to_cp_size}')
                 # if scheduler_output.req_id_to_cp_size:
@@ -1239,13 +1260,17 @@ class NPUModelRunner(GPUModelRunner):
                     if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
                         # logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_sending}")
                         for req_id in modelrunneroutput.kv_connector_output.finished_sending:
-                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(
+                                req_id
+                            )
                             # logger.info(f"chenxiao--debug 0000000000")
                             # self.req_id_to_cp_size.pop(req_id, None)
                     if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
                         # logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_recving}")
                         for req_id in modelrunneroutput.kv_connector_output.finished_recving:
-                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(
+                                req_id
+                            )
                             # logger.info(f"chenxiao--debug 0000000000")
 
                     return modelrunneroutput
@@ -1430,13 +1455,13 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
                     logger.info(f"chenxiao--debug kv_connector_output.finished_sending:{kv_connector_output.finished_sending}")
                     for req_id in kv_connector_output.finished_sending:
-                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
                         logger.info(f"chenxiao--debug 222222222222")
                 if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
                     logger.info(f"chenxiao--debug kv_connector_output.finished_recving:{kv_connector_output.finished_recving}")
                     for req_id in kv_connector_output.finished_recving:
-                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
-                        
+                        kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
+
                         # self.req_id_to_cp_size.pop(req_id, None)
 
                 hidden_states = self._model_forward(
@@ -1465,12 +1490,12 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
                     logger.info(f"chenxiao--debug kv_connector_output.finished_sending:{kv_connector_output.finished_sending}")
                     for req_id in kv_connector_output.finished_sending:
-                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
                         logger.info(f"chenxiao--debug 3333333333333333")
                 if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
                     logger.info(f"chenxiao--debug kv_connector_output.finished_recving:{kv_connector_output.finished_recving}")
                     for req_id in kv_connector_output.finished_recving:
-                        kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                        kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
                         logger.info(f"chenxiao--debug 3333333333333333")
                         # self.req_id_to_cp_size.pop(req_id, None)
 
@@ -1480,11 +1505,11 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("post process"):
             if kv_connector_output.finished_sending:
                 for req_id in kv_connector_output.finished_sending:
-                    kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                    kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
             
             if kv_connector_output.finished_recving:
                 for req_id in kv_connector_output.finished_recving:
-                    kv_connector_output.req_id_to_cp_size[req_id] = self.req_id_to_cp_size[req_id]
+                    kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states

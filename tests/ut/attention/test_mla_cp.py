@@ -499,6 +499,66 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[0], B)
         self.assertEqual(result.shape[1], self.impl.v_head_dim)
 
+    @patch('vllm_ascend.attention.context_parallel.mla_cp.get_forward_context')
+    @patch('vllm_ascend.attention.context_parallel.mla_cp._npu_update_dycp_attn')
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    def test_forward_decode_dycp_updates_only_dycp_rows(
+            self, mock_npu_fused_infer_attention_score, mock_update_dycp_attn,
+            mock_get_forward_context):
+        self.impl.dcp_size = 2
+        self.impl.dycp_size = 2
+        self.impl.num_kv_heads = 1
+        self.impl.num_heads = 16
+        self.impl.kv_lora_rank = 64
+        self.impl.qk_nope_head_dim = 64
+
+        batch_size = 2
+        num_heads = self.impl.num_heads * self.impl.dcp_size
+        block_size = 128
+        num_blocks = 100
+
+        q_nope = torch.randn(batch_size, num_heads,
+                             self.impl.qk_nope_head_dim)
+        q_pe = torch.randn(batch_size, num_heads,
+                           self.impl.qk_rope_head_dim)
+        k_nope = torch.randn(num_blocks, 1, block_size,
+                             self.impl.kv_lora_rank)
+        k_pe = torch.randn(num_blocks, 1, block_size,
+                           self.impl.qk_rope_head_dim)
+
+        attn_output = torch.randn(batch_size, num_heads,
+                                  self.impl.kv_lora_rank)
+        expected_dp_output = attn_output[1].clone()
+        softmax_lse = torch.randn(batch_size, num_heads, 1)
+        dycp_attn_output = torch.randn(1, num_heads, self.impl.kv_lora_rank)
+
+        mock_npu_fused_infer_attention_score.return_value = [
+            attn_output, softmax_lse
+        ]
+        mock_update_dycp_attn.return_value = dycp_attn_output
+        mock_get_forward_context.return_value = MagicMock(capturing=False,
+                                                          is_draft_model=False)
+
+        attn_metadata = MagicMock()
+        attn_metadata.attn_state = AscendAttentionState.DecodeOnly
+        attn_metadata.num_dycp_reqs = 1
+        attn_metadata.decode = MagicMock()
+        attn_metadata.decode.attn_mask = None
+        attn_metadata.decode.actual_seq_lengths_q = MagicMock()
+        attn_metadata.decode.seq_lens = MagicMock()
+        attn_metadata.decode.block_table = MagicMock()
+
+        self.impl._v_up_proj = MagicMock()
+        self.impl._v_up_proj.return_value = torch.randn(
+            batch_size, self.impl.v_head_dim)
+
+        self.impl._forward_decode(q_nope, q_pe, k_nope, k_pe, block_size,
+                                  attn_metadata)
+
+        v_proj_input = self.impl._v_up_proj.call_args.args[0]
+        torch.testing.assert_close(v_proj_input[0], dycp_attn_output[0])
+        torch.testing.assert_close(v_proj_input[1], expected_dp_output)
+
     @patch("torch_npu.atb.npu_paged_cache_load")
     @patch("torch_npu.atb.npu_ring_mla")
     @patch_distributed_groups(dcp_size=2, pcp_size=2)

@@ -1123,7 +1123,14 @@ class AscendMlaCPImpl(AscendMLAImpl):
 
         # Update out&lse
         if self.dycp_size > 1 and num_dycp_reqs > 0:
-            dycp_attn_output = _npu_update_dycp_attn(num_dycp_reqs, attn_output, softmax_lse)
+            dycp_attn_output = _npu_update_dycp_attn(
+                num_dycp_reqs, attn_output, softmax_lse
+            )
+            # Only the leading DYCP requests need cross-rank merging. Keep any
+            # trailing DP requests in their original positions for sampling.
+            attn_output[:num_dycp_reqs].copy_(
+                dycp_attn_output.to(attn_output.dtype)
+            )
             return self._v_up_proj(attn_output)
         attn_out_lse = _process_attn_out_lse(attn_output, softmax_lse)
         attn_output = _npu_attention_update(self.kv_lora_rank, attn_out_lse)

@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/worker.py
 #
 
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -30,6 +31,26 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+
+def build_batch_req_id_to_cp_size(
+    req_ids: Sequence[str],
+    scheduler_req_cp_size: Mapping[str, int],
+    cached_req_cp_size: Mapping[str, int],
+    num_cp_request: int,
+    fallback_cp_size: int,
+) -> dict[str, int]:
+    req_id_to_cp_size: dict[str, int] = {}
+    for req_index, req_id in enumerate(req_ids):
+        if req_id in scheduler_req_cp_size:
+            cp_size = scheduler_req_cp_size[req_id]
+        elif req_index < num_cp_request:
+            cached_cp_size = cached_req_cp_size.get(req_id)
+            cp_size = cached_cp_size if cached_cp_size and cached_cp_size > 1 else fallback_cp_size
+        else:
+            cp_size = 1
+        req_id_to_cp_size[req_id] = cp_size
+    return req_id_to_cp_size
 
 
 class PCPManager:
@@ -485,15 +506,22 @@ class PCPManager:
         tokens_original: list[int] | None = None,
     ):
         if not self.pcp_use_hybrid_attn or tokens_original is None:
+            num_logits_reqs = min(num_reqs, cu_num_tokens.shape[0])
+            num_dycp_reqs = min(self.num_dycp_reqs, num_logits_reqs)
+            cu_num_tokens_np = torch.from_numpy(cu_num_tokens[:num_logits_reqs])
             logits_indices = (
-                torch.from_numpy(cu_num_tokens) * self.pcp_world_size
-                - self.num_pcp_pads_cpu_tensor[: self.num_reqs]
+                cu_num_tokens_np * self.pcp_world_size
+                - self.num_pcp_pads_cpu_tensor[:num_logits_reqs]
                 - 1
             )
-            cu_num_tokens_np = torch.from_numpy(cu_num_tokens)
-            logits_indices = cu_num_tokens_np * self.pcp_world_size - self.num_pcp_pads_cpu_tensor[: self.num_reqs] - 1
-            logits_indices[self.num_dycp_reqs: self.num_reqs] = cu_num_tokens_np[
-                self.num_dycp_reqs - 1] * 2 + cu_num_tokens_np[self.num_dycp_reqs:] - cu_num_tokens_np[self.num_dycp_reqs - 1] - 1
+            if 0 < num_dycp_reqs < num_logits_reqs:
+                dycp_tokens = cu_num_tokens_np[num_dycp_reqs - 1]
+                logits_indices[num_dycp_reqs:num_logits_reqs] = (
+                    dycp_tokens * self.pcp_world_size
+                    + cu_num_tokens_np[num_dycp_reqs:num_logits_reqs]
+                    - dycp_tokens
+                    - 1
+                )
         else:
             tokens_original_tensor = torch.tensor(tokens_original, dtype=torch.int32)
             num_prefill_reqs = (tokens_original_tensor > self.decode_threshold).sum().item()
