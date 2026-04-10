@@ -354,7 +354,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 self.prefill_dycp_rank = self.dycp_rank
             else:
                 self.prefill_dycp_size = 1
-                self.prefill_dycp_rank = 1
+                self.prefill_dycp_rank = 0
             self.common_pcp_size = self.dycp_size if self.prefill_dycp_size > 1 else self.pcp_size
             self.common_pcp_rank = self.dycp_rank if self.prefill_dycp_size > 1 else self.pcp_rank
         except AssertionError:
@@ -641,7 +641,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             return output.fill_(0)
         dycp_metadata, dp_metadata = split_attn_metadata(attn_metadata, attn_metadata.num_dycp_reqs, self.dycp_size)
         num_decode_tokens = attn_metadata.num_decode_tokens
-        if self.common_pcp_size > 1 and attn_metadata.num_dycp_reqs and (attn_metadata.decode is None or attn_metadata.decode == 0):
+        if self.common_pcp_size > 1 and attn_metadata.num_dycp_reqs and attn_metadata.decode is None:
             if dycp_metadata:
                 cp_hidden_states = hidden_states[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.common_pcp_size]
                 self._forward_common(layer_name, cp_hidden_states, kv_cache, dycp_metadata, need_gather_q_kv, output[num_decode_tokens: num_decode_tokens + attn_metadata.num_actual_tokens_pcp_padded // self.common_pcp_size])

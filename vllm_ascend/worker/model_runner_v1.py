@@ -1217,10 +1217,9 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
-                if self.dycp_size > 1:
-                    self.req_id_to_cp_size.update(
-                        getattr(scheduler_output, "req_id_to_cp_size", {}) or {}
-                    )
+                self.req_id_to_cp_size.update(
+                    getattr(scheduler_output, "req_id_to_cp_size", {}) or {}
+                )
 
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
@@ -1248,22 +1247,34 @@ class NPUModelRunner(GPUModelRunner):
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     modelrunneroutput = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
-                    # modelrunneroutput.kv_connector_output.req_id_to_cp_size = scheduler_output.req_id_to_cp_size
-                    if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
-                        # logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_sending}")
-                        for req_id in modelrunneroutput.kv_connector_output.finished_sending:
-                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(
-                                req_id
-                            )
-                            # logger.info(f"chenxiao--debug 0000000000")
-                            # self.req_id_to_cp_size.pop(req_id, None)
-                    if modelrunneroutput.kv_connector_output is not None and self.dycp_size > 1:
-                        # logger.info(f"chenxiao--debug modelrunneroutput.kv_connector_output.finished_sending:{modelrunneroutput.kv_connector_output.finished_recving}")
-                        for req_id in modelrunneroutput.kv_connector_output.finished_recving:
-                            modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(
-                                req_id
-                            )
-                            # logger.info(f"chenxiao--debug 0000000000")
+                    # Always set req_id_to_cp_size for finished requests,
+                    # regardless of dycp_size. When dp_per_domain > 1 and
+                    # dycp_size == 1 (single domain), cp_size can still be > 1
+                    # for requests assigned to multiple DP ranks. The aggregator
+                    # needs the correct cp_size to compute the expected report
+                    # count. Without this, req_id_to_cp_size stays as {} (not
+                    # None), causing KeyError in update_finished_set.
+                    if modelrunneroutput.kv_connector_output is not None:
+                        if modelrunneroutput.kv_connector_output.finished_sending:
+                            for req_id in modelrunneroutput.kv_connector_output.finished_sending:
+                                modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(
+                                    req_id
+                                )
+                        if modelrunneroutput.kv_connector_output.finished_recving:
+                            for req_id in modelrunneroutput.kv_connector_output.finished_recving:
+                                modelrunneroutput.kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(
+                                    req_id
+                                )
+                        logger.info(
+                            "chenxiao--debug kv_no_forward dp_rank=%d, "
+                            "finished_sending=%s, finished_recving=%s, "
+                            "req_id_to_cp_size=%s, self.req_id_to_cp_size_keys=%s",
+                            self.cp_rank,
+                            modelrunneroutput.kv_connector_output.finished_sending,
+                            modelrunneroutput.kv_connector_output.finished_recving,
+                            dict(modelrunneroutput.kv_connector_output.req_id_to_cp_size),
+                            list(self.req_id_to_cp_size.keys())[:10],
+                        )
 
                     return modelrunneroutput
                 if self.cache_config.kv_sharing_fast_prefill:
@@ -1444,14 +1455,12 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
-                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                if kv_connector_output.finished_sending is not None:
                     for req_id in kv_connector_output.finished_sending:
                         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
-                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                if kv_connector_output.finished_recving is not None:
                     for req_id in kv_connector_output.finished_recving:
                         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
-
-                        # self.req_id_to_cp_size.pop(req_id, None)
 
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
@@ -1476,13 +1485,12 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output, clear_metadata=clear_kv_metadata
                 ) as kv_connector_output,
             ):
-                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                if kv_connector_output.finished_sending is not None:
                     for req_id in kv_connector_output.finished_sending:
                         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
-                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                if kv_connector_output.finished_recving is not None:
                     for req_id in kv_connector_output.finished_recving:
                         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
-                        # self.req_id_to_cp_size.pop(req_id, None)
 
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
@@ -1495,6 +1503,16 @@ class NPUModelRunner(GPUModelRunner):
             if kv_connector_output.finished_recving:
                 for req_id in kv_connector_output.finished_recving:
                     kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
+            if kv_connector_output.finished_sending or kv_connector_output.finished_recving:
+                logger.info(
+                    "chenxiao--debug execute_model_post dp_rank=%d, "
+                    "finished_sending=%s, finished_recving=%s, "
+                    "req_id_to_cp_size=%s",
+                    self.cp_rank,
+                    kv_connector_output.finished_sending,
+                    kv_connector_output.finished_recving,
+                    dict(kv_connector_output.req_id_to_cp_size),
+                )
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states

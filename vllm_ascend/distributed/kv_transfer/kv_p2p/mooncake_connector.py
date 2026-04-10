@@ -388,7 +388,13 @@ class KVCacheRecvingThread(threading.Thread):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
             remote_port_send_num = {}
-        logger.debug(f"Adding request {request_id} to the queue.")
+        logger.info(
+            "chenxiao--debug recv_add_request req=%s, remote_port=%d, "
+            "local_blocks=%d, remote_blocks=%d, offset=%d, all_done=%s",
+            request_id, remote_handshake_port,
+            len(local_block_ids), len(remote_block_ids),
+            offset, all_task_done,
+        )
         self.request_queue.put(
             {
                 "request_id": request_id,
@@ -413,6 +419,9 @@ class KVCacheRecvingThread(threading.Thread):
         """
         return self.task_tracker.get_and_clear_finished_requests()
 
+    def add_not_transfer_request(self, request_id: str):
+        self.task_tracker.add_not_transfer_request(request_id)
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self.ready_event.set()
@@ -436,14 +445,18 @@ class KVCacheRecvingThread(threading.Thread):
         all_task_done = req_meta["all_task_done"]
 
         try:
-            logger.debug(f"Starting to transfer KV cache for request {remote_request_id}.")
+            logger.info(
+                "chenxiao--debug recv_handle req=%s, remote_req=%s, remote_port=%d, all_done=%s",
+                request_id, remote_request_id, remote_handshake_port, all_task_done,
+            )
             self._transfer_kv_cache(req_meta)
-            logger.debug(f"Finished transferring KV cache for request {remote_request_id}.")
+            logger.info("chenxiao--debug recv_handle req=%s transfer DONE", request_id)
         except Exception as e:
             logger.error(f"Failed to transfer KV cache for request {remote_request_id}: {e}", exc_info=True)
         finally:
             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
             if all_task_done:
+                logger.info("chenxiao--debug recv_handle req=%s calling update_done_task_count", request_id)
                 self.task_tracker.update_done_task_count(request_id)
                 if request_id in self.proc_not_transfer_request:
                     del self.proc_not_transfer_request[request_id]
@@ -1024,6 +1037,14 @@ class MooncakeConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
 
+        logger.info(
+            "chenxiao--debug build_meta _reqs_need_recv=%d, _reqs_need_send=%d, "
+            "_reqs_in_batch=%d, dp_per_domain=%d, recv_keys=%s",
+            len(self._reqs_need_recv), len(self._reqs_need_send),
+            len(self._reqs_in_batch), self.dp_per_domain,
+            list(self._reqs_need_recv.keys())[:5],
+        )
+
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids, num_external_tokens) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -1321,10 +1342,15 @@ class MooncakeConnectorWorker:
             else set()
         )
         if self.tp_rank == 0:
+            recv_tracker = self.kv_recv_thread.task_tracker if self.kv_recv_thread else None
             logger.info(
-                "Number of completed KV cache send requests: %d, receive requests: %d",
+                "Number of completed KV cache send requests: %d, receive requests: %d. "
+                "[tracker: reqs_to_process=%d, finished=%d, queue_size=%d]",
                 len(done_sending),
                 len(done_recving),
+                len(recv_tracker.reqs_to_process) if recv_tracker else -1,
+                len(recv_tracker.finished_requests) if recv_tracker else -1,
+                self.kv_recv_thread.request_queue.qsize() if self.kv_recv_thread else -1,
             )
         return done_sending, done_recving
 
@@ -1342,7 +1368,15 @@ class MooncakeConnectorWorker:
         decode_dycp_enable = True if meta.local_dycp_ranks else False
         if decode_dycp_enable and self.dp_rank not in meta.local_dycp_ranks:
             self.remote_port_send_num[meta.remote_engine_id] = None
-            # self.kv_recv_thread.add_not_transfer_request(req_id)
+            # NOTE: Do NOT call recv_thread.add_not_transfer_request here.
+            # Non-participating DP workers are excluded from recv_thread
+            # task_tracker registration in start_load_kv, so they must not
+            # report finished_recving either. The KVOutputAggregator counts
+            # world_size (TP*PP*PCP) reports per request; extra reports from
+            # non-participating workers would cause the counter to reset and
+            # produce duplicate finished_recving, crashing the scheduler.
+            if self.kv_send_thread is not None:
+                self.kv_send_thread.add_not_transfer_request(req_id)
             return [], [], []
         remote_dycp_ranks = meta.remote_dycp_ranks if prefill_dycp_enable else list(range(meta.remote_pcp_size))
         local_dycp_ranks = meta.local_dycp_ranks if decode_dycp_enable else [0]
@@ -1553,6 +1587,7 @@ class MooncakeConnectorWorker:
 
             # make sure the last block (which may be unfull) of P nodes is put to the last block of D node
             remote_block_nums: list[int] = []
+            remote_cp_rank_indices: list[int] = []  # Track original cp_rank for remote_block_ids indexing
             final_block_idx: int | None = None
             local_cp_rank = self.dcp_rank + local_pcp_rank * self.dcp_size
             if self.dp_size > 1 and local_pcp_size == 1:
@@ -1562,14 +1597,14 @@ class MooncakeConnectorWorker:
                     if last_block_location == cp_rank:
                         final_block_idx = len(remote_block_nums)
                     remote_block_nums.append(block_num)
+                    remote_cp_rank_indices.append(cp_rank)
 
             assert local_remote_block_port_mapping is not None
             if final_block_idx is not None:
                 final_block_num = remote_block_nums.pop(final_block_idx)
                 remote_block_nums.append(final_block_num)
-                # if prefill_dycp_enable:
-                #     remote_block_ids = meta_remote_block_ids.pop(final_block_idx) if prefill_dycp_enable else meta_remote_block_ids
-                #     meta_remote_block_ids.append(remote_block_ids)
+                final_cp_rank = remote_cp_rank_indices.pop(final_block_idx)
+                remote_cp_rank_indices.append(final_cp_rank)
                 for mapping in local_remote_block_port_mapping:
                     final_block_port = mapping.pop(final_block_idx)
                     mapping.append(final_block_port)
@@ -1589,7 +1624,8 @@ class MooncakeConnectorWorker:
 
             for remote_kv_id in range(len(remote_handshake_port_list)):
                 num_blocks_to_pull = remote_block_nums[remote_kv_id]
-                remote_block_ids = meta.remote_block_ids[remote_kv_id] if prefill_dycp_enable else meta.remote_block_ids
+                original_cp_rank = remote_cp_rank_indices[remote_kv_id]
+                remote_block_ids = meta.remote_block_ids[original_cp_rank] if prefill_dycp_enable else meta.remote_block_ids
                 assert num_blocks_to_pull <= len(remote_block_ids)
                 remote_block_ids_list.append(remote_block_ids[:num_blocks_to_pull])   # [[1,2],[4,5]]
                 local_block_ids_list.append(
@@ -1606,6 +1642,34 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        logger.info(
+            "chenxiao--debug start_load_kv dp_rank=%d, requests=%d, reqs_in_batch=%d, "
+            "requests_to_send=%d, req_ids=%s",
+            self.dp_rank, len(metadata.requests), len(metadata.reqs_in_batch),
+            len(metadata.requests_to_send), list(metadata.requests.keys())[:5],
+        )
+        # First pass: determine which requests this worker participates in
+        # for recv. Non-participating DP workers must NOT register in
+        # recv_thread task_tracker, because world_size (used by aggregation)
+        # only counts TP*PP*PCP workers. Extra reports would cause the
+        # aggregation counter to reach 0 multiple times, producing duplicate
+        # finished_recving notifications and assertion failures.
+        participating_recv_req_ids = set()
+        for req_id, meta in metadata.requests.items():
+            decode_dycp_enable = bool(meta.local_dycp_ranks)
+            if decode_dycp_enable and self.dp_rank not in meta.local_dycp_ranks:
+                # This worker's DP rank does not participate in this request
+                continue
+            participating_recv_req_ids.add(req_id)
+
+        # Register in task_tracker BEFORE adding to threads to avoid race
+        # condition where thread completes before registration.
+        for req_id in metadata.reqs_in_batch:
+            if self.kv_send_thread is not None:
+                self.kv_send_thread.task_tracker.add_req_to_process(req_id)
+            if self.kv_recv_thread is not None and req_id in participating_recv_req_ids:
+                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
+
         for req_id, meta in metadata.requests.items():
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
@@ -1620,10 +1684,27 @@ class MooncakeConnectorWorker:
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
             remote_req_id = meta.remote_request_id
 
-            if len(meta.remote_dycp_ranks) > 0 or meta.remote_pcp_size * meta.remote_dcp_size or self.dp_per_domain > 1:
-                rank_id = torch.distributed.get_rank()
+            if len(meta.remote_dycp_ranks) > 0 or meta.remote_pcp_size * meta.remote_dcp_size > 1 or self.dp_per_domain > 1:
                 remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = self._get_kv_split_metadata(
                     req_id, meta
+                )
+
+                if not remote_handshake_port_list:
+                    logger.info(
+                        "chenxiao--debug start_load_kv dp_rank=%d, req=%s SKIPPED (empty split metadata)",
+                        self.dp_rank, req_id,
+                    )
+                    continue
+
+                logger.info(
+                    "chenxiao--debug start_load_kv dp_rank=%d, req=%s, "
+                    "remote_ports=%s, local_blocks_lens=%s, remote_blocks_lens=%s, "
+                    "handshake_port=%d, port_base=%d, side_channel_port=%d",
+                    self.dp_rank, req_id,
+                    remote_handshake_port_list,
+                    [len(b) for b in local_block_ids_list],
+                    [len(b) for b in remote_block_ids_list],
+                    self.handshake_port, self.port_base, self.side_channel_port,
                 )
 
                 for pcp_dcp_rank in range(len(remote_handshake_port_list)):
@@ -1675,12 +1756,6 @@ class MooncakeConnectorWorker:
                         tp_num_need_pulls=tp_num_need_pulls,
                         all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
                     )
-
-        for req_id in metadata.reqs_in_batch:
-            if self.kv_send_thread is not None:
-                self.kv_send_thread.task_tracker.add_req_to_process(req_id)
-            if self.kv_recv_thread is not None:
-                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1 and self.dp_per_domain == 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
