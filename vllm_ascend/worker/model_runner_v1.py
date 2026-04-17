@@ -1442,12 +1442,12 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
-                if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
-                    for req_id in kv_connector_output.finished_sending:
-                        kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
-                if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
-                    for req_id in kv_connector_output.finished_recving:
-                        kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
+                # if kv_connector_output.finished_sending is not None and self.dycp_size > 1:
+                #     for req_id in kv_connector_output.finished_sending:
+                #         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
+                # if kv_connector_output.finished_recving is not None and self.dycp_size > 1:
+                #     for req_id in kv_connector_output.finished_recving:
+                #         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
 
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
@@ -1476,13 +1476,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
         with record_function_or_nullcontext("post process"):
-            # if kv_connector_output.finished_sending and self.dycp_size > 1:
-            #     for req_id in kv_connector_output.finished_sending:
-            #         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
+            if kv_connector_output.finished_sending and self.dycp_size > 1:
+                for req_id in kv_connector_output.finished_sending:
+                    kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
 
-            # if kv_connector_output.finished_recving and self.dycp_size > 1:
-            #     for req_id in kv_connector_output.finished_recving:
-            #         kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
+            if kv_connector_output.finished_recving and self.dycp_size > 1:
+                for req_id in kv_connector_output.finished_recving:
+                    kv_connector_output.req_id_to_cp_size[req_id] = self._get_req_cp_size(req_id)
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
