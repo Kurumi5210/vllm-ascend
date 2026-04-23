@@ -1815,6 +1815,7 @@ class NPUModelRunner(GPUModelRunner):
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
+        logprobs_lists: LogprobsLists | None = None
         cu_num_tokens: list[int] | None = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
