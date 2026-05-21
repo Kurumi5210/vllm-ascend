@@ -1674,6 +1674,11 @@ class MooncakeConnectorWorker:
                 )
                 decode_cp_size = len(meta.local_dycp_ranks) if meta.local_dycp_ranks else None
 
+                # if not remote_handshake_port_list:
+                #     assert self.kv_recv_thread is not None
+                #     self.kv_recv_thread.task_tracker.add_not_transfer_request(req_id)
+                #     continue
+
                 for pcp_dcp_rank in range(len(remote_handshake_port_list)):
                     for i in range(tp_num_need_pulls):
                         assert self.kv_recv_thread is not None
