@@ -296,6 +296,7 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
                                             )
         if common_attn_metadata.num_dycp_reqs:
             decode_metadata.seq_lens[:common_attn_metadata.num_dycp_reqs] = cp_seq_len[:common_attn_metadata.num_dycp_reqs]
+            decode_metadata.seq_lens_list = decode_metadata.seq_lens.tolist()
 
         actual_seq_lengths_q = torch.arange(self.num_decodes_flatten) + 1
         decode_metadata.actual_seq_lengths_q = actual_seq_lengths_q
@@ -556,12 +557,12 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 if target_kv_len is None:
                     target_kv_len = q_nope.shape[0]
 
-                actual_seq_lengths_kv = _align_seq_like(
-                    decode_meta.seq_lens,
-                    target_kv_len,
-                    template_seq=captured_actual_seq_lengths_kv,
-                )
-                actual_seq_lengths_kv = actual_seq_lengths_kv.tolist()
+                actual_seq_lengths_kv = list(decode_meta.seq_lens_list)
+                pad_length = target_kv_len - len(actual_seq_lengths_kv)
+                if pad_length > 0:
+                    actual_seq_lengths_kv = actual_seq_lengths_kv + [0] * pad_length
+                elif pad_length < 0:
+                    actual_seq_lengths_kv = actual_seq_lengths_kv[:target_kv_len]
 
                 # Only TND layout uses query cumulative lengths. For BNSD path
                 # this argument should stay as captured (typically None).
@@ -1030,6 +1031,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         assert decode_meta is not None
 
         seq_lens = decode_meta.seq_lens
+        seq_lens_list = decode_meta.seq_lens_list
         num_tokens = q_nope.size(0)
         # shape of knope/k_pe for npu graph mode should be:
         # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
@@ -1079,7 +1081,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             "block_table": decode_meta.block_table,
             "block_size": block_size,
             "actual_seq_lengths": actual_seq_lengths,
-            "actual_seq_lengths_kv": seq_lens,
+            "actual_seq_lengths_kv": seq_lens_list,
             "softmax_lse_flag": True,
         }
 
@@ -1129,7 +1131,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     weak_ref_tensors(decode_meta.block_table),
                     block_size,
                     actual_seq_lengths,
-                    decode_meta.seq_lens,
+                    decode_meta.seq_lens_list,
                     weak_ref_tensors(attn_output),
                     weak_ref_tensors(softmax_lse),
                 )
