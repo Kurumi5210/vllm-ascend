@@ -73,6 +73,17 @@ MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 M = TypeVar("M", bound=AscendMLAMetadata)
 
 
+def _decode_actual_seq_lengths_kv(decode_meta: AscendMLADecodeMetadata) -> list[int]:
+    seq_lens = decode_meta.cp_seq_len
+    if seq_lens is None:
+        seq_lens = decode_meta.seq_lens_list
+    if isinstance(seq_lens, torch.Tensor):
+        return seq_lens.tolist()
+    if isinstance(seq_lens, np.ndarray):
+        return seq_lens.tolist()
+    return list(seq_lens)
+
+
 class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -286,17 +297,27 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         assert long_seq_metadata is not None
         num_computed_tokens_of_pcp_dcp = long_seq_metadata.num_computed_tokens_of_pcp_dcp
         assert num_computed_tokens_of_pcp_dcp is not None
-        # [bs, pcp_size, dcp_size]
+        # [bs, pcp_size, dcp_size] for PCP/DCP, or DYCP-local
+        # lengths for the leading DYCP requests.
         num_computed_tokens_of_cp_dcp_array = np.array(num_computed_tokens_of_pcp_dcp)[: self.num_decodes_flatten]
 
-        cp_seq_len = get_dcp_local_seq_lens(decode_metadata.seq_lens,
-                                            self.dycp_size,
-                                            self.dycp_rank,
-                                            self.cp_local_block_size
-                                            )
         if common_attn_metadata.num_dycp_reqs:
-            decode_metadata.seq_lens[:common_attn_metadata.num_dycp_reqs] = cp_seq_len[:common_attn_metadata.num_dycp_reqs]
-            decode_metadata.seq_lens_list = decode_metadata.seq_lens.tolist()
+            num_dycp_decodes = min(common_attn_metadata.num_dycp_reqs, decode_metadata.seq_lens.numel())
+            cp_seq_len = decode_metadata.seq_lens.clone()
+            cp_seq_len[:num_dycp_decodes] = get_dcp_local_seq_lens(
+                decode_metadata.seq_lens[:num_dycp_decodes],
+                self.dycp_size,
+                self.dycp_rank,
+                self.cp_local_block_size,
+            )
+            cp_seq_len_list = cp_seq_len.tolist()
+            if len(decode_metadata.seq_lens_list) > len(cp_seq_len_list):
+                cp_seq_len_list += decode_metadata.seq_lens_list[len(cp_seq_len_list) :]
+            decode_metadata.cp_seq_len = cp_seq_len_list
+        elif num_computed_tokens_of_cp_dcp_array.size > 0:
+            decode_metadata.cp_seq_len = num_computed_tokens_of_cp_dcp_array[
+                :, self.pcp_rank, self.dcp_rank
+            ].tolist()
 
         actual_seq_lengths_q = torch.arange(self.num_decodes_flatten) + 1
         decode_metadata.actual_seq_lengths_q = actual_seq_lengths_q
@@ -438,6 +459,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
+        assert graph_params is not None, "MLA-CP ACLGraph params have not been initialized."
 
         def _make_graph_key(tokens: int, dycp_reqs: int):
             return (tokens, dycp_reqs) if dycp_reqs > 0 else tokens
@@ -447,6 +469,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         handles = graph_params.handles.get(graph_key, [])
         events = graph_params.events.get(graph_key, [])
         workspace = graph_params.workspaces.get(graph_key)
+        candidate_keys = [graph_key]
 
         # In MLA-CP decode, capture key may be based on real decode tokens
         # while replay path may pass padded token count. If the direct key
@@ -466,9 +489,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
             for candidate in [num_tokens] + candidate_tokens:
                 # Try exact dycp key first.
                 candidate_keys.append(_make_graph_key(candidate, num_dycp_reqs))
-                # Fallback to 1D key when capture happened without dycp split.
-                if num_dycp_reqs > 0:
-                    candidate_keys.append(candidate)
 
             # Keep order and deduplicate.
             deduped_candidate_keys = list(dict.fromkeys(candidate_keys))
@@ -486,6 +506,20 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     break
 
         num_layers = len(forward_context.attn_metadata)
+        assert len(attn_params) > 0 and len(handles) > 0 and len(events) > 0, (
+            "Missing captured MLA-CP ACLGraph params for "
+            f"num_tokens={num_tokens}, num_dycp_reqs={num_dycp_reqs}, "
+            f"tried_keys={candidate_keys}, available_keys={list(graph_params.attn_params.keys())}."
+        )
+        assert len(attn_params) == len(handles) == len(events), (
+            "Captured MLA-CP ACLGraph params are inconsistent: "
+            f"key={graph_key}, attn_params={len(attn_params)}, "
+            f"handles={len(handles)}, events={len(events)}."
+        )
+        assert len(attn_params) >= num_layers, (
+            "Captured MLA-CP ACLGraph params do not cover all attention layers: "
+            f"key={graph_key}, captured_layers={len(attn_params)}, runtime_layers={num_layers}."
+        )
 
         # If this key contains multiple capture rounds, pick the chunk that
         # matches current decode token shape first.
@@ -509,14 +543,30 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 handles = handles[selected : selected + num_layers]
                 events = events[selected : selected + num_layers]
             else:
-                attn_params = attn_params[:num_layers]
-                handles = handles[:num_layers]
-                events = events[:num_layers]
+                captured_q_tokens = [
+                    param[0].shape[0]
+                    if (
+                        isinstance(param, tuple)
+                        and len(param) > 0
+                        and isinstance(param[0], torch.Tensor)
+                    )
+                    else None
+                    for param in attn_params[: max_offset + 1]
+                ]
+                raise AssertionError(
+                    "No captured MLA-CP ACLGraph params match runtime decode token shape: "
+                    f"key={graph_key}, expected_decode_tokens={expected_decode_tokens}, "
+                    f"captured_q_tokens={captured_q_tokens}."
+                )
         else:
             # Align with other attention backends by default.
             attn_params = attn_params[:num_layers]
             handles = handles[:num_layers]
             events = events[:num_layers]
+        assert len(attn_params) == len(handles) == len(events) == num_layers, (
+            "Selected MLA-CP ACLGraph params do not match runtime attention layers: "
+            f"key={graph_key}, selected={len(attn_params)}, runtime_layers={num_layers}."
+        )
         # FIXME: Behold! We are using a temporary hack here to update the args
         # for each layer's attention op in the graph.
         with torch.npu.stream(update_stream):
@@ -557,7 +607,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 if target_kv_len is None:
                     target_kv_len = q_nope.shape[0]
 
-                actual_seq_lengths_kv = list(decode_meta.seq_lens_list)
+                actual_seq_lengths_kv = _decode_actual_seq_lengths_kv(decode_meta)
                 pad_length = target_kv_len - len(actual_seq_lengths_kv)
                 if pad_length > 0:
                     actual_seq_lengths_kv = actual_seq_lengths_kv + [0] * pad_length
@@ -1030,8 +1080,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         num_dycp_reqs = attn_metadata.num_dycp_reqs
         assert decode_meta is not None
 
-        seq_lens = decode_meta.seq_lens
-        seq_lens_list = decode_meta.seq_lens_list
+        actual_seq_lengths_kv = _decode_actual_seq_lengths_kv(decode_meta)
         num_tokens = q_nope.size(0)
         # shape of knope/k_pe for npu graph mode should be:
         # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
@@ -1081,7 +1130,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             "block_table": decode_meta.block_table,
             "block_size": block_size,
             "actual_seq_lengths": actual_seq_lengths,
-            "actual_seq_lengths_kv": seq_lens_list,
+            "actual_seq_lengths_kv": actual_seq_lengths_kv,
             "softmax_lse_flag": True,
         }
 
@@ -1131,7 +1180,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     weak_ref_tensors(decode_meta.block_table),
                     block_size,
                     actual_seq_lengths,
-                    decode_meta.seq_lens_list,
+                    actual_seq_lengths_kv,
                     weak_ref_tensors(attn_output),
                     weak_ref_tensors(softmax_lse),
                 )
