@@ -13,7 +13,6 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 MLAPO_MAX_SUPPORTED_TOKENS = 1024
 from vllm_ascend.attention.utils import (
@@ -100,6 +99,13 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         except AssertionError:
             self.dycp_size = 1
             self.dycp_rank = 0
+        kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
+        if self.dycp_size > 1 and kv_role == "kv_consumer":
+            self.decode_dycp_size = self.dycp_size
+            self.decode_dycp_rank = self.dycp_rank
+        else:
+            self.decode_dycp_size = 1
+            self.decode_dycp_rank = 0
 
         self.common_pcp_size = self.dycp_size if self.dycp_size > 1 else self.pcp_size
         self.common_pcp_rank = self.dycp_rank if self.dycp_size > 1 else self.pcp_rank
@@ -289,14 +295,26 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         # [bs, pcp_size, dcp_size]
         num_computed_tokens_of_cp_dcp_array = np.array(num_computed_tokens_of_pcp_dcp)[: self.num_decodes_flatten]
 
-        cp_seq_len = get_dcp_local_seq_lens(decode_metadata.seq_lens,
-                                            self.dycp_size,
-                                            self.dycp_rank,
-                                            self.cp_local_block_size
-                                            )
-        if common_attn_metadata.num_dycp_reqs:
-            decode_metadata.seq_lens[:common_attn_metadata.num_dycp_reqs] = cp_seq_len[:common_attn_metadata.num_dycp_reqs]
-            decode_metadata.seq_lens_list = decode_metadata.seq_lens.tolist()
+        cp_seq_len = list(decode_metadata.seq_lens_list)
+        if num_computed_tokens_of_cp_dcp_array.size > 0:
+            cp_rank = self.dcp_rank * self.decode_dycp_size + self.decode_dycp_rank
+            pcp_rank = (
+                self.common_pcp_rank
+                if common_attn_metadata.num_dycp_reqs and self.decode_dycp_size == 1
+                else self.pcp_rank
+            )
+            cp_seq_len_local = num_computed_tokens_of_cp_dcp_array[:, pcp_rank, cp_rank].tolist()
+            if common_attn_metadata.num_dycp_reqs:
+                cp_seq_len[: len(cp_seq_len_local)] = cp_seq_len_local
+                decode_metadata.seq_lens[: len(cp_seq_len_local)] = torch.tensor(
+                    cp_seq_len_local,
+                    dtype=decode_metadata.seq_lens.dtype,
+                    device=decode_metadata.seq_lens.device,
+                )
+                decode_metadata.seq_lens_list = decode_metadata.seq_lens.tolist()
+            else:
+                cp_seq_len = cp_seq_len_local
+        decode_metadata.cp_seq_len = cp_seq_len
 
         actual_seq_lengths_q = torch.arange(self.num_decodes_flatten) + 1
         decode_metadata.actual_seq_lengths_q = actual_seq_lengths_q
@@ -557,7 +575,12 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 if target_kv_len is None:
                     target_kv_len = q_nope.shape[0]
 
-                actual_seq_lengths_kv = list(decode_meta.seq_lens_list)
+                seq_len = decode_meta.cp_seq_len
+                if seq_len is None:
+                    seq_len = decode_meta.seq_lens_list
+                if isinstance(seq_len, torch.Tensor):
+                    seq_len = seq_len.tolist()
+                actual_seq_lengths_kv = list(seq_len)
                 pad_length = target_kv_len - len(actual_seq_lengths_kv)
                 if pad_length > 0:
                     actual_seq_lengths_kv = actual_seq_lengths_kv + [0] * pad_length
@@ -1030,8 +1053,11 @@ class AscendMlaCPImpl(AscendMLAImpl):
         num_dycp_reqs = attn_metadata.num_dycp_reqs
         assert decode_meta is not None
 
-        seq_lens = decode_meta.seq_lens
-        seq_lens_list = decode_meta.seq_lens_list
+        seq_lens_list = decode_meta.cp_seq_len
+        if seq_lens_list is None:
+            seq_lens_list = decode_meta.seq_lens_list
+        if isinstance(seq_lens_list, torch.Tensor):
+            seq_lens_list = seq_lens_list.tolist()
         num_tokens = q_nope.size(0)
         # shape of knope/k_pe for npu graph mode should be:
         # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
@@ -1131,7 +1157,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     weak_ref_tensors(decode_meta.block_table),
                     block_size,
                     actual_seq_lengths,
-                    decode_meta.seq_lens_list,
+                    seq_lens_list,
                     weak_ref_tensors(attn_output),
                     weak_ref_tensors(softmax_lse),
                 )

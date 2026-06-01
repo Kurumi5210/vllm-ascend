@@ -2338,8 +2338,13 @@ class NPUModelRunner(GPUModelRunner):
         def _get_pcp_metadata(block_table_tensor):
             if not self.use_cp:
                 return None, block_table_tensor
+            pcp_metadata_num_tokens = (
+                total_num_pcp_scheduled_tokens
+                if self.use_prefill_cp
+                else num_tokens
+            )
             return self.pcp_manager.generate_pcp_metadata(
-                total_num_pcp_scheduled_tokens,
+                pcp_metadata_num_tokens,
                 self.query_lens,
                 self.input_batch,
                 num_scheduled_tokens_np,

@@ -1103,14 +1103,28 @@ class PCPManager:
         ori_query_lens_cpu = self.query_lens_pcp_full.cpu[:num_reqs_padded]
         if self.pcp_world_size * self.dcp_world_size * self.dycp_world_size > 1:
             assert num_scheduled_tokens is not None
+            num_cp_metadata_reqs = self.num_dycp_reqs
+            if (
+                num_cp_metadata_reqs == 0
+                and self.pcp_world_size == 1
+                and self.dycp_world_size == 1
+                and self.dcp_world_size > 1
+            ):
+                num_cp_metadata_reqs = num_reqs
             decode_context_lens = (
                 input_batch.num_computed_tokens_cpu[: self.num_decode_reqs]
                 + num_scheduled_tokens[: self.num_decode_reqs]
             )
-            prefill_context_lens = input_batch.num_computed_tokens_cpu[self.num_decode_reqs : self.num_dycp_reqs]
+            prefill_context_lens = input_batch.num_computed_tokens_cpu[
+                self.num_decode_reqs : num_cp_metadata_reqs
+            ]
             context_lens = np.concatenate([decode_context_lens, prefill_context_lens])
             num_computed_tokens_of_pcp_dcp = torch.zeros(
-                [self.num_dycp_reqs * self.decode_threshold, self.pcp_world_size, self.dcp_world_size*self.decode_dycp_word_size],
+                [
+                    num_cp_metadata_reqs * self.decode_threshold,
+                    self.pcp_world_size,
+                    self.dcp_world_size * self.decode_dycp_word_size,
+                ],
                 dtype=torch.int32,
             )
             # For pcp + spec decode, we flatten seq_lens
@@ -1118,15 +1132,15 @@ class PCPManager:
             # Same as block_table, we flatten decode seq_lens to query_lens,
             # and keep prefill seq_lens unchanged.
             for decode_idx in range(self.decode_threshold):
-                if self.num_dycp_reqs > 0:
+                if num_cp_metadata_reqs > 0:
                     num_computed_tokens_of_pcp_dcp[self.decode_threshold - 1 - decode_idx :: self.decode_threshold] = (
                         self._get_cp_local_seq_lens(
                             torch.tensor(context_lens) - decode_idx,
                             self.pcp_world_size,
-                            self.decode_dycp_word_size,
+                            self.dcp_world_size * self.decode_dycp_word_size,
                             self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
                         )
-                    )[:self.num_dycp_reqs]
+                    )[:num_cp_metadata_reqs]
 
             if self.decode_threshold > 1:
                 num_computed_tokens_of_pcp_dcp_list = []
