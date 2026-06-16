@@ -127,6 +127,7 @@ from vllm_ascend.utils import (
     lmhead_tp_enable,
     set_weight_prefetch_method,
 )
+from vllm_ascend.worker.dycp_sampling import temporary_dycp_sample_generators
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager, build_batch_req_id_to_cp_size
 
@@ -466,31 +467,39 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.req_id_to_cp_size.get(req_id, 1),
         )
 
-    def _sync_dycp_sampled_token_ids(
+    @contextmanager
+    def _dycp_deterministic_sample_generators(
         self,
         scheduler_output: "SchedulerOutput",
-        sampled_token_ids: torch.Tensor,
-    ) -> None:
-        if self.dycp_size <= 1 or sampled_token_ids is None:
+        phase: str,
+    ):
+        if self.dycp_size <= 1:
+            yield
             return
 
-        num_cp_request = int(getattr(scheduler_output, "num_cp_request", 0) or 0)
-        if num_cp_request <= 0 or sampled_token_ids.numel() == 0:
-            return
+        req_ids = self.input_batch.req_ids
+        temperatures = [
+            getattr(getattr(self.requests.get(req_id), "sampling_params", None), "temperature", None)
+            for req_id in req_ids
+        ]
 
-        # DyCP decodes one logical request on multiple DP ranks. Keep the
-        # sampled token authoritative on rank 0 before bookkeeping writes it.
-        num_rows = min(num_cp_request, sampled_token_ids.shape[0])
-        if num_rows <= 0:
-            return
+        def make_generator(seed: int) -> torch.Generator:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(seed)
+            return generator
 
-        dycp_group = get_dycp_group()
-        if getattr(dycp_group, "world_size", 1) <= 1:
-            return
-
-        sync_token_ids = sampled_token_ids[:num_rows].contiguous()
-        dycp_group.broadcast(sync_token_ids, src=0)
-        sampled_token_ids[:num_rows].copy_(sync_token_ids)
+        with temporary_dycp_sample_generators(
+            self.input_batch.sampling_metadata.generators,
+            generator_factory=make_generator,
+            dycp_size=self.dycp_size,
+            num_cp_request=int(getattr(scheduler_output, "num_cp_request", 0) or 0),
+            req_ids=req_ids,
+            num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+            temperatures=temperatures,
+            model_seed=getattr(self.model_config, "seed", 0),
+            phase=phase,
+        ):
+            yield
 
     def _update_batch_req_cp_sizes(
         self,
@@ -1644,11 +1653,15 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.debugger.start()
         if self.ascend_config.enable_async_exponential:
-            self.sampler.do_async_exponential(
-                b_s=logits_indices.shape[0],
-                head_dim=self.model_config.get_vocab_size(),
-                generators=self.input_batch.sampling_metadata.generators,
-            )
+            with self._dycp_deterministic_sample_generators(
+                scheduler_output,
+                "async_exponential",
+            ):
+                self.sampler.do_async_exponential(
+                    b_s=logits_indices.shape[0],
+                    head_dim=self.model_config.get_vocab_size(),
+                    generators=self.input_batch.sampling_metadata.generators,
+                )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -1818,12 +1831,14 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        with record_function_or_nullcontext("sample_token"):
+        with (
+            record_function_or_nullcontext("sample_token"),
+            self._dycp_deterministic_sample_generators(
+                scheduler_output,
+                "target",
+            ),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
-        self._sync_dycp_sampled_token_ids(
-            scheduler_output,
-            sampler_output.sampled_token_ids,
-        )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
