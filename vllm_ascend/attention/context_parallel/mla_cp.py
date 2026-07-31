@@ -377,7 +377,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
         speculative_config=None,
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
-        num_dycp_reqs: int = 0,
     ):
         def _seq_len(seq):
             if seq is None:
@@ -445,10 +444,11 @@ class AscendMlaCPImpl(AscendMLAImpl):
         else:
             graph_params = get_graph_params()
 
-        def _make_graph_key(tokens: int, dycp_reqs: int):
-            return (tokens, dycp_reqs) if dycp_reqs > 0 else tokens
-
-        graph_key = _make_graph_key(num_tokens, num_dycp_reqs)
+        # The upstream CudagraphDispatcher already separates runtime graphs
+        # with BatchDescriptor(num_tokens, num_dycp_reqs).  Ascend attention
+        # parameters remain keyed by token count only; they are not a second
+        # graph-dispatch mechanism.
+        graph_key = num_tokens
         attn_params = graph_params.attn_params.get(graph_key, [])
         handles = graph_params.handles.get(graph_key, [])
         events = graph_params.events.get(graph_key, [])
@@ -468,18 +468,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 if isinstance(decode_tokens, int) and decode_tokens >= 0:
                     candidate_tokens.append(decode_tokens)
 
-            candidate_keys = []
-            for candidate in [num_tokens] + candidate_tokens:
-                # Try exact dycp key first.
-                candidate_keys.append(_make_graph_key(candidate, num_dycp_reqs))
-                # Fallback to 1D key when capture happened without dycp split.
-                if num_dycp_reqs > 0:
-                    candidate_keys.append(candidate)
-
-            # Keep order and deduplicate.
-            deduped_candidate_keys = list(dict.fromkeys(candidate_keys))
-
-            for candidate_key in deduped_candidate_keys:
+            for candidate_key in dict.fromkeys([num_tokens] + candidate_tokens):
                 candidate_params = graph_params.attn_params.get(candidate_key, [])
                 candidate_handles = graph_params.handles.get(candidate_key, [])
                 candidate_events = graph_params.events.get(candidate_key, [])
@@ -1099,7 +1088,9 @@ class AscendMlaCPImpl(AscendMLAImpl):
             graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        graph_key = (num_tokens, num_dycp_reqs) if num_dycp_reqs > 0 else num_tokens
+        # Graph dispatch is owned by the upstream BatchDescriptor.  Keep the
+        # Ascend attention task metadata keyed by token count only.
+        graph_key = num_tokens
         if _EXTRA_CTX.capturing:
             stream = torch_npu.npu.current_stream()
             event = torch.npu.ExternalEvent()
@@ -1119,7 +1110,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     k_nope,
                     **common_kwargs,
                 )
-                update_graph_params_workspaces(num_tokens, workspace, num_dycp_reqs=num_dycp_reqs)
+                update_graph_params_workspaces(num_tokens, workspace)
             attn_output = torch.empty_like(q_nope)
             if input_layout == "BNSD":
                 softmax_lse = torch.empty((num_tokens, num_heads, 1, 1), dtype=torch.float, device=q_nope.device)

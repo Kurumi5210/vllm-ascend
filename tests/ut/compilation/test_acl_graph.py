@@ -32,7 +32,8 @@ from vllm_ascend.attention.mla_v1 import (AscendMLADecodeMetadata,
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphEntry, ACLGraphWrapper, get_draft_graph_params, get_graph_params,
     set_draft_graph_params, set_graph_params,
-    update_draft_graph_params_workspaces)
+    update_draft_graph_params_workspaces, update_full_graph_params,
+    update_graph_params_workspaces)
 
 
 class TestACLGraphEntry(TestBase):
@@ -50,6 +51,19 @@ class TestACLGraphEntry(TestBase):
         self.assertIsNone(entry.aclgraph)
         self.assertIsNone(entry.output)
         self.assertIsNone(entry.input_addresses)
+
+    def test_aclgraph_entry_preserves_upstream_dycp_descriptor(self):
+        first = BatchDescriptor(num_tokens=8, num_dycp_reqs=1)
+        second = BatchDescriptor(num_tokens=8, num_dycp_reqs=2)
+
+        entries = {
+            first: ACLGraphEntry(batch_descriptor=first),
+            second: ACLGraphEntry(batch_descriptor=second),
+        }
+
+        self.assertEqual(len(entries), 2)
+        self.assertIs(entries[first].batch_descriptor, first)
+        self.assertIs(entries[second].batch_descriptor, second)
 
     def test_aclgraph_entry_with_values(self):
         """Test ACLGraphEntry initialization with specified values"""
@@ -213,33 +227,6 @@ class TestACLGraphWrapper(TestBase):
         self.mock_runnable.assert_called_once_with("arg1", "arg2")
         self.assertEqual(result, "test_output")
 
-    @patch('vllm_ascend.compilation.acl_graph.get_forward_context')
-    @patch('vllm_ascend.compilation.acl_graph.current_platform')
-    @patch('vllm_ascend.compilation.acl_graph.envs')
-    def test_call_asserts_invalid_dycp_graph_key(
-            self, mock_envs, mock_current_platform, mock_get_forward_context):
-        """Test __call__ rejects aclgraph keys with more DYCP requests than bs"""
-        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
-        self.mock_forward_context.batch_descriptor = BatchDescriptor(
-            num_tokens=4,
-            num_dycp_reqs=5,
-        )
-        self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
-        mock_get_forward_context.return_value = self.mock_forward_context
-
-        wrapper = ACLGraphWrapper(
-            runnable=self.mock_runnable,
-            vllm_config=self.mock_vllm_config,
-            runtime_mode=CUDAGraphMode.FULL,
-            cudagraph_options=self.mock_cudagraph_options)
-
-        with self.assertRaises(AssertionError) as context:
-            wrapper("arg1", "arg2")
-
-        self.assertIn("num_dycp_reqs=5", str(context.exception))
-        self.mock_runnable.assert_not_called()
-
     @patch('vllm_ascend.compilation.acl_graph.torch')
     @patch(
         'vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled'
@@ -300,9 +287,9 @@ class TestACLGraphWrapper(TestBase):
         self.mock_runnable.assert_called_once_with(test_tensor, "arg2")
 
         # Verify the entry was created and updated
-        self.assertIn(self.mock_batch_descriptor,
+        self.assertIn(self.mock_batch_descriptor.num_tokens,
                       wrapper.concrete_aclgraph_entries)
-        entry = wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor]
+        entry = wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor.num_tokens]
         self.assertEqual(entry.aclgraph, mock_npu_graph)
         self.assertEqual(entry.output, "weak_ref_output")
 
@@ -311,6 +298,16 @@ class TestACLGraphWrapper(TestBase):
 
         # Should return the original output (not weak ref)
         self.assertEqual(result, "test_output")
+
+        # A different upstream DyCP descriptor with the same token count must
+        # reuse the Ascend graph entry instead of capturing another graph.
+        self.mock_forward_context.batch_descriptor = BatchDescriptor(
+            num_tokens=self.mock_batch_descriptor.num_tokens,
+            num_dycp_reqs=2,
+        )
+        wrapper(test_tensor, "arg2")
+        self.assertEqual(len(wrapper.concrete_aclgraph_entries), 1)
+        mock_npu_graph.replay.assert_called_once()
 
     @patch('vllm_ascend.compilation.acl_graph.torch')
     @patch(
@@ -785,6 +782,39 @@ class TestDraftGraphParams(TestBase):
     def test_get_draft_graph_params(self, draft_graph_params_mock):
         graph_params = get_draft_graph_params()
         self.assertIs(draft_graph_params_mock, graph_params)
+
+
+class TestGraphParamsKeying(TestBase):
+
+    def test_update_full_graph_params_uses_backend_contract(self):
+        attn_backend = MagicMock()
+        update_stream = MagicMock(name="FakeStream")
+        forward_context = MagicMock()
+        vllm_config = MagicMock()
+
+        update_full_graph_params(
+            attn_backend,
+            update_stream,
+            forward_context,
+            4,
+            vllm_config,
+        )
+
+        call = attn_backend.get_impl_cls.return_value.update_graph_params.call_args
+        self.assertIsNotNone(call)
+        self.assertNotIn("num_cp_reqs", call.kwargs)
+        self.assertNotIn("num_dycp_reqs", call.kwargs)
+
+    @patch('vllm_ascend.compilation.acl_graph._graph_params')
+    def test_update_graph_params_workspace_uses_token_key(self,
+                                                           graph_params_mock):
+        graph_params_mock.workspaces = {4: None}
+
+        update_graph_params_workspaces(4, 6)
+
+        self.assertEqual(graph_params_mock.workspaces, {4: 6})
+        self.assertTrue(all(isinstance(key, int)
+                            for key in graph_params_mock.workspaces))
 
 
 class TestPCPDCPGraphParams(TestBase):

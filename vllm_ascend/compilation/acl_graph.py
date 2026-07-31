@@ -43,13 +43,13 @@ class ACLGraphWrapper:
     1. At initialization, a runtime mode is assigned to the wrapper (FULL or
     PIECEWISE).
     2. At runtime, the wrapper receives a runtime_mode and a
-    batch_descriptor(key) from the forward context and blindly trust them
-    for aclgraph dispatching.
+    BatchDescriptor from the forward context. Ascend uses only its
+    num_tokens field as the local capture key.
     3. If runtime_mode is NONE or runtime_mode does not match the mode of the
     wrapper, just call the runnable directly.
     4. Otherwise, i.e., the runtime_mode matches the mode of the wrapper,
-    the wrapper will perform aclgraph capture(if key does not exist, create
-    a new entry and cache it) or replay (if key exists in the cache).
+    the wrapper will perform aclgraph capture (if the token key does not
+    exist, create a new entry and cache it) or replay (if it exists).
 
     Note: ACLGraphWrapper does not store persistent buffers or copy any
     runtime inputs into that buffers for replay. We assume implementing them
@@ -84,9 +84,9 @@ class ACLGraphWrapper:
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
-        # the entries for different batch descriptors that we need to capture
-        # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        # The upstream dispatcher may distinguish descriptors by DyCP request
+        # count, but Ascend graph capture only depends on the token dimension.
+        self.concrete_aclgraph_entries: dict[int, ACLGraphEntry] = {}
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -116,15 +116,13 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        _assert_valid_dycp_graph_key(
-            batch_descriptor.num_tokens, batch_descriptor.num_dycp_reqs
-        )
+        # Keep the upstream BatchDescriptor for dispatching, while collapsing
+        # Ascend capture entries to one graph per token count.
+        graph_key = batch_descriptor.num_tokens
+        if graph_key not in self.concrete_aclgraph_entries:
+            self.concrete_aclgraph_entries[graph_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
-            # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
-
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        entry = self.concrete_aclgraph_entries[graph_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
@@ -212,32 +210,6 @@ class ACLGraphWrapper:
         return entry.output
 
 
-GraphKey = int | tuple[int, int]
-
-
-def _assert_valid_dycp_graph_key(bs: int, num_dycp_reqs: int) -> None:
-    assert num_dycp_reqs <= bs, (
-        f"Invalid aclgraph key: num_dycp_reqs={num_dycp_reqs} "
-        f"must be <= bs={bs}."
-    )
-
-
-def _get_graph_key(num_tokens: int, num_dycp_reqs: int = 0) -> GraphKey:
-    _assert_valid_dycp_graph_key(num_tokens, num_dycp_reqs)
-    return (num_tokens, num_dycp_reqs) if num_dycp_reqs > 0 else num_tokens
-
-
-def _ensure_graph_key_initialized(params: "GraphParams", graph_key: GraphKey) -> None:
-    if graph_key not in params.events:
-        params.events[graph_key] = []
-    if graph_key not in params.workspaces:
-        params.workspaces[graph_key] = None
-    if graph_key not in params.handles:
-        params.handles[graph_key] = []
-    if graph_key not in params.attn_params:
-        params.attn_params[graph_key] = []
-
-
 def weak_ref_workspaces(params):
     if params is None:
         return
@@ -256,31 +228,7 @@ def update_full_graph_params(
     speculative_config=None,
     num_dcp_pcp_tokens=None,
     draft_attn_metadatas=None,
-    num_cp_reqs: int | None = None,
-    num_dycp_reqs: int | None = None,
 ):
-    # Respect explicitly passed values (including 0). This avoids
-    # accidentally overriding runtime cp-request count with stale values
-    # from batch_descriptor in decode graph replay.
-    if num_cp_reqs is not None:
-        effective_num_cp_reqs = num_cp_reqs
-    elif num_dycp_reqs is not None:
-        effective_num_cp_reqs = num_dycp_reqs
-    else:
-        batch_descriptor = getattr(forward_context, "batch_descriptor", None)
-        effective_num_cp_reqs = getattr(
-            batch_descriptor,
-            "num_cp_reqs",
-            getattr(
-                batch_descriptor,
-                "num_dycp_reqs",
-                getattr(
-                    forward_context,
-                    "num_cp_reqs",
-                    getattr(forward_context, "num_dycp_reqs", 0),
-                ),
-            ),
-        )
     impl_cls = attn_backend.get_impl_cls()
     impl_cls.update_graph_params(
         update_stream=update_stream,
@@ -290,16 +238,15 @@ def update_full_graph_params(
         speculative_config=speculative_config,
         num_dcp_pcp_tokens=num_dcp_pcp_tokens,
         draft_attn_metadatas=draft_attn_metadatas,
-        num_dycp_reqs=effective_num_cp_reqs,
     )
 
 
 @dataclass
 class GraphParams:
-    events: dict[GraphKey, list[torch.npu.ExternalEvent]]
-    workspaces: dict[GraphKey, torch.Tensor]
-    handles: dict[GraphKey, list[torch_npu._C._NPUTaskGroupHandle]]
-    attn_params: dict[GraphKey, list[tuple]]
+    events: dict[int, list[torch.npu.ExternalEvent]]
+    workspaces: dict[int, torch.Tensor]
+    handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
+    attn_params: dict[int, list[tuple]]
 
 
 
@@ -318,12 +265,10 @@ def set_graph_params(aclgraph_capture_sizes: list[int]):
     )
 
 
-def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor, num_dycp_reqs: int = 0):
+def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
     global _graph_params
     if _graph_params is not None:
-        graph_key = _get_graph_key(num_tokens, num_dycp_reqs)
-        _ensure_graph_key_initialized(_graph_params, graph_key)
-        _graph_params.workspaces[graph_key] = workspace
+        _graph_params.workspaces[num_tokens] = workspace
 
 
 def get_graph_params():
@@ -345,12 +290,10 @@ def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
     )
 
 
-def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any, num_dycp_reqs: int = 0):
+def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any):
     global _draft_graph_params
     if _draft_graph_params is not None:
-        graph_key = _get_graph_key(num_tokens, num_dycp_reqs)
-        _ensure_graph_key_initialized(_draft_graph_params, graph_key)
-        _draft_graph_params.workspaces[graph_key] = workspace
+        _draft_graph_params.workspaces[num_tokens] = workspace
 
 
 def get_draft_graph_params():

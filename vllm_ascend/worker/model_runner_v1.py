@@ -36,7 +36,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group, get_dycp_group
-from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -1670,7 +1670,6 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if not self.use_prefill_cp else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
-                num_cp_reqs=scheduler_output.num_cp_request,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2110,37 +2109,6 @@ class NPUModelRunner(GPUModelRunner):
                 NPUModelRunner._all_gather_hidden_states_list(hidden_states[1]),
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
-
-    def _update_full_graph_params_if_needed(
-        self,
-        forward_context: ForwardContext,
-        num_tokens_padded: int,
-        positions: torch.Tensor | None,
-    ) -> None:
-        if (
-            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
-            and not self.use_sparse
-        ):
-            if self.enable_enpu:
-                torch.npu.current_stream().synchronize()
-
-            assert positions is not None
-            # Use runtime forward context as the source of truth.
-            # batch_descriptor may be reused by dispatcher and can diverge from
-            # current step cp-request count in some decode paths. Keep the
-            # explicit runtime value (including 0) to avoid graph-key mismatch.
-            num_cp_reqs = getattr(forward_context, "num_cp_reqs", getattr(forward_context, "num_dycp_reqs", 0))
-            update_full_graph_params(
-                self.attn_backend,
-                self.update_stream,
-                forward_context,
-                num_tokens_padded,
-                self.vllm_config,
-                self.speculative_config,
-                positions.shape[0],
-                num_cp_reqs=num_cp_reqs,
-            )
 
     def _model_forward(
         self,
@@ -2833,7 +2801,6 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
-                num_cp_reqs=num_dycp_reqs,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
