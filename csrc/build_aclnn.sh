@@ -55,6 +55,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "dispatch_ffn_combine"
         "dispatch_ffn_combine_bf16"
         "dispatch_gmm_combine_decode"
+        "allto_all_attn_update_all_gather"
         "moe_combine_normal"
         "moe_dispatch_normal"
         "dispatch_layout"

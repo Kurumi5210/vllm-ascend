@@ -30,6 +30,7 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
+#include "allto_all_attn_update_all_gather/allto_all_attn_update_all_gather_torch_adpt.h"
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
@@ -805,6 +806,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           int sparse_mode=3) -> Tensor"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    // Inplace fused {alltoall + cross-cp LSE-weighted attn update + head-AllGather}.
+    // attn is input & output (Tensor! inplace marking); lse is a pure input (no
+    // lse output — downstream does not consume it, only Phase B weighting reads it).
+    // Returns attn ref (mirrors dispatch_ffn_combine) for Dynamo functionalization
+    // + npugraph_ex graph capture. mask_num is a 0-d int32 device tensor
+    // (per-rank active token count).
+    ops.def(
+        "npu_allto_all_attn_update_all_gather(Tensor! attn, Tensor lse, Tensor mask_num,"
+        "                                    str group, int group_size) -> (Tensor attn)"
+    );
+    ops.impl("npu_allto_all_attn_update_all_gather", torch::kPrivateUse1,
+             &vllm_ascend::npu_allto_all_attn_update_all_gather);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"

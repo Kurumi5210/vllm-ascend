@@ -1670,7 +1670,6 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if not self.use_prefill_cp else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
-                num_cp_reqs=scheduler_output.num_cp_request,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2126,11 +2125,6 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.current_stream().synchronize()
 
             assert positions is not None
-            # Use runtime forward context as the source of truth.
-            # batch_descriptor may be reused by dispatcher and can diverge from
-            # current step cp-request count in some decode paths. Keep the
-            # explicit runtime value (including 0) to avoid graph-key mismatch.
-            num_cp_reqs = getattr(forward_context, "num_cp_reqs", getattr(forward_context, "num_dycp_reqs", 0))
             update_full_graph_params(
                 self.attn_backend,
                 self.update_stream,
@@ -2139,7 +2133,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 self.speculative_config,
                 positions.shape[0],
-                num_cp_reqs=num_cp_reqs,
             )
 
     def _model_forward(
@@ -2833,7 +2826,6 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
-                num_cp_reqs=num_dycp_reqs,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds

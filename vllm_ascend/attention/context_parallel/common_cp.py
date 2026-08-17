@@ -5,6 +5,8 @@ import torch.distributed as dist
 import torch_npu
 from vllm.distributed import get_dcp_group, get_decode_context_model_parallel_world_size, get_pcp_group, get_dycp_group
 
+from vllm_ascend.utils import enable_custom_op
+
 
 @dataclass
 class AscendPCPMetadata:
@@ -182,4 +184,54 @@ def _npu_attention_update(head_size, attn_out_lse: torch.Tensor) -> torch.Tensor
     attn_out, _ = torch_npu.npu_attention_update(lse_list, out_list, 0)
     attn_out = attn_out.view(-1, H, D)
     return attn_out
+
+def _npu_update_dycp_attn_fused(
+    attn_output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    group_name: str,
+    group_size: int,
+    mask_num: torch.Tensor,
+) -> torch.Tensor:
+    """Merge DyCP attention outputs with the fused custom operator."""
+    enable_custom_op()
+
+    num_tokens, num_heads, head_dim = attn_output.shape
+
+    # Prevent reshape from silently allocating large temporary tensors.
+    assert attn_output.is_contiguous(), "attn_output must be contiguous"
+    assert softmax_lse.is_contiguous(), "softmax_lse must be contiguous"
+    assert num_heads % group_size == 0, "num_heads must be divisible by group_size"
+
+    local_heads = num_heads // group_size
+
+    # [T, CP, local_heads, D] -> [T*CP, local_heads*D]
+    attn_2d = attn_output.view(
+        num_tokens,
+        group_size,
+        local_heads,
+        head_dim,
+    ).view(
+        num_tokens * group_size,
+        local_heads * head_dim,
+    )
+
+    # [T, CP, local_heads] -> [T*CP, local_heads]
+    lse_2d = softmax_lse.view(
+        num_tokens,
+        group_size,
+        local_heads,
+    ).view(
+        num_tokens * group_size,
+        local_heads,
+    )
+
+    attn_out = torch.ops._C_ascend.npu_allto_all_attn_update_all_gather(
+        attn_2d,
+        lse_2d,
+        mask_num,
+        group_name,
+        group_size,
+    )
+
+    return attn_out.view(num_tokens, num_heads, head_dim)
 

@@ -62,8 +62,8 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     AscendPCPMetadata,
     CPChunkedContextMetadata,
     _npu_attention_update,
+    _npu_update_dycp_attn_fused,
     _process_attn_out_lse,
-    _npu_update_dycp_attn,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params, update_graph_params_workspaces
@@ -105,6 +105,12 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
         self.common_pcp_size = self.dycp_size if self.dycp_size > 1 else self.pcp_size
         self.common_pcp_rank = self.dycp_rank if self.dycp_size > 1 else self.pcp_rank
 
+        self.dycp_mask_num = torch.zeros(
+            (),
+            dtype=torch.int32,
+            device=device,
+        )
+
         self.cp_local_block_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
         self.cp_virtual_block_size = self.cp_local_block_size * self.dcp_size * self.common_pcp_size
         self.block_size = (self.block_size * self.cp_virtual_block_size) // np.gcd(
@@ -125,7 +131,23 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
             self.slot_mapping[self.num_decode_tokens : self.num_decode_tokens * self.common_pcp_size].fill_(-1)
         metadata_cls.slot_mapping = self.slot_mapping
         metadata_cls.num_dycp_reqs = common_attn_metadata.num_dycp_reqs
-        dycp_metadata, dp_metadata = split_attn_metadata(metadata_cls, metadata_cls.num_dycp_reqs, self.dycp_size, self.chunked_prefill_workspace_size, self.block_size, common_attn_metadata, self.dcp_size, self.pcp_size, self.dycp_size, self.cp_virtual_block_size, self.cp_local_block_size)
+        mask_value = int(common_attn_metadata.num_dycp_reqs)
+        self.dycp_mask_num.fill_(mask_value)
+
+        metadata_cls.dycp_mask = self.dycp_mask_num
+        dycp_metadata, dp_metadata = split_attn_metadata(
+            metadata_cls,
+            metadata_cls.num_dycp_reqs,
+            self.dycp_size,
+            self.chunked_prefill_workspace_size,
+            self.block_size,
+            common_attn_metadata,
+            self.dcp_size,
+            self.pcp_size,
+            self.dycp_size,
+            self.cp_virtual_block_size,
+            self.cp_local_block_size,
+        )
         metadata_cls.dp_metadata = dp_metadata
         metadata_cls.dycp_metadata = dycp_metadata
         return metadata_cls
@@ -368,6 +390,16 @@ class AscendMlaCPImpl(AscendMLAImpl):
             self.dycp_size = 1
             self.dycp_rank = 0
 
+        self._dycp_hccl_group_name: str | None = None
+
+    def _get_dycp_hccl_group_name(self) -> str:
+        if self._dycp_hccl_group_name is None:
+            device_group = get_dycp_group().device_group
+            local_rank = torch.distributed.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self._dycp_hccl_group_name = backend.get_hccl_comm_name(local_rank)
+        return self._dycp_hccl_group_name
+
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -377,7 +409,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
         speculative_config=None,
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
-        num_dycp_reqs: int = 0,
     ):
         def _seq_len(seq):
             if seq is None:
@@ -445,10 +476,11 @@ class AscendMlaCPImpl(AscendMLAImpl):
         else:
             graph_params = get_graph_params()
 
-        def _make_graph_key(tokens: int, dycp_reqs: int):
-            return (tokens, dycp_reqs) if dycp_reqs > 0 else tokens
-
-        graph_key = _make_graph_key(num_tokens, num_dycp_reqs)
+        # The upstream CudagraphDispatcher already separates runtime graphs
+        # with BatchDescriptor(num_tokens, num_dycp_reqs).  Ascend attention
+        # parameters remain keyed by token count only; they are not a second
+        # graph-dispatch mechanism.
+        graph_key = num_tokens
         attn_params = graph_params.attn_params.get(graph_key, [])
         handles = graph_params.handles.get(graph_key, [])
         events = graph_params.events.get(graph_key, [])
@@ -468,18 +500,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 if isinstance(decode_tokens, int) and decode_tokens >= 0:
                     candidate_tokens.append(decode_tokens)
 
-            candidate_keys = []
-            for candidate in [num_tokens] + candidate_tokens:
-                # Try exact dycp key first.
-                candidate_keys.append(_make_graph_key(candidate, num_dycp_reqs))
-                # Fallback to 1D key when capture happened without dycp split.
-                if num_dycp_reqs > 0:
-                    candidate_keys.append(candidate)
-
-            # Keep order and deduplicate.
-            deduped_candidate_keys = list(dict.fromkeys(candidate_keys))
-
-            for candidate_key in deduped_candidate_keys:
+            for candidate_key in dict.fromkeys([num_tokens] + candidate_tokens):
                 candidate_params = graph_params.attn_params.get(candidate_key, [])
                 candidate_handles = graph_params.handles.get(candidate_key, [])
                 candidate_events = graph_params.events.get(candidate_key, [])
@@ -1099,7 +1120,9 @@ class AscendMlaCPImpl(AscendMLAImpl):
             graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        graph_key = (num_tokens, num_dycp_reqs) if num_dycp_reqs > 0 else num_tokens
+        # Graph dispatch is owned by the upstream BatchDescriptor.  Keep the
+        # Ascend attention task metadata keyed by token count only.
+        graph_key = num_tokens
         if _EXTRA_CTX.capturing:
             stream = torch_npu.npu.current_stream()
             event = torch.npu.ExternalEvent()
@@ -1119,7 +1142,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     k_nope,
                     **common_kwargs,
                 )
-                update_graph_params_workspaces(num_tokens, workspace, num_dycp_reqs=num_dycp_reqs)
+                update_graph_params_workspaces(num_tokens, workspace)
             attn_output = torch.empty_like(q_nope)
             if input_layout == "BNSD":
                 softmax_lse = torch.empty((num_tokens, num_heads, 1, 1), dtype=torch.float, device=q_nope.device)
@@ -1167,14 +1190,13 @@ class AscendMlaCPImpl(AscendMLAImpl):
             softmax_lse = softmax_lse.permute(0, 2, 1, 3).reshape(B_lse * Q_S, N_lse, 1)
 
         # Update out&lse
-        if self.dycp_size > 1 and num_dycp_reqs > 0:
-            dycp_attn_output = _npu_update_dycp_attn(
-                num_dycp_reqs, attn_output, softmax_lse
-            )
-            # Only the leading DYCP requests need cross-rank merging. Keep any
-            # trailing DP requests in their original positions for sampling.
-            attn_output[:num_dycp_reqs].copy_(
-                dycp_attn_output.to(attn_output.dtype)
+        if self.dycp_size > 1:
+            attn_output = _npu_update_dycp_attn_fused(
+                attn_output=attn_output,
+                softmax_lse=softmax_lse,
+                group_name=self._get_dycp_hccl_group_name(),
+                group_size=self.dycp_size,
+                mask_num=attn_metadata.dycp_mask,
             )
             return self._v_up_proj(attn_output)
         elif self.dycp_size == 1:

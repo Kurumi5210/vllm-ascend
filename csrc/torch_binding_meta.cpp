@@ -192,6 +192,19 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
+// Inplace: attn shape unchanged (kernel only rearranges rows + LSE-weighted
+// reduce + head-AllGather). ls e is a pure input (no lse output — dropped after
+// Phase B weighting). Returns attn ref only, matching torch_binding.cpp schema.
+at::Tensor& npu_allto_all_attn_update_all_gather_meta(
+    at::Tensor& attn,
+    const at::Tensor& lse,
+    const at::Tensor& mask_num,
+    c10::string_view group,
+    int64_t group_size
+) {
+    return attn;
+}
+
 at::Tensor npu_lightning_indexer_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
@@ -600,6 +613,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
+    // Inplace alltoall + LSE-weighted attn update + head-AllGather
+    ops.impl("npu_allto_all_attn_update_all_gather",
+             &vllm_ascend::meta::npu_allto_all_attn_update_all_gather_meta);
     // matmul allreduce add rmsnorm
     ops.impl("matmul_allreduce_add_rmsnorm", &vllm_ascend::meta::matmul_allreduce_add_rmsnorm_meta);
     // moe_init_routing_custom
